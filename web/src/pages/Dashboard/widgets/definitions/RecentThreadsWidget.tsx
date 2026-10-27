@@ -1,11 +1,17 @@
 import { useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
-import i18n from '@/i18n';
-import { MessagesSquare, ArrowUpRight, MessageSquareText, Zap } from 'lucide-react';
+import { useLocale } from '@/hooks/useLocale';
+import { clockTime, shortMonthDay, shortWeekday } from '@/lib/format';
+import { useNow } from '@/hooks/useNow';
+import { MessagesSquare, ArrowUpRight, MessageSquareText } from 'lucide-react';
 import { useQuery } from '@tanstack/react-query';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate } from 'react-router';
 import { useWorkspaces } from '@/hooks/useWorkspaces';
-import { getRecentThreads, getWorkspaceThreads } from '@/pages/ChatAgent/utils/api';
+import { useWorkspaceLabel } from '@/hooks/useWorkspaceLabel';
+import { HomeRowIcon } from '@/hooks/useHomeWorkspace';
+import { isHomeWorkspace } from '@/lib/homeWorkspace';
+import { getRecentThreads } from '@/pages/ChatAgent/utils/api';
+import { workspaceThreadsQuery } from '@/pages/ChatAgent/utils/threadQueries';
 import { clearChatSession } from '@/pages/ChatAgent/hooks/utils/chatSessionRestore';
 import type { Thread, ThreadsResponse, Workspace } from '@/types/api';
 import { queryKeys } from '@/lib/queryKeys';
@@ -26,9 +32,9 @@ const BUCKET_KEY: Record<BucketKey, string> = {
   older: 'dashboard.widgets.recentThreads.bucket_older',
 };
 
-function bucketFor(date: Date): BucketKey {
-  const now = new Date();
-  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+function bucketFor(date: Date, now: number): BucketKey {
+  const today = new Date(now);
+  const startOfToday = new Date(today.getFullYear(), today.getMonth(), today.getDate()).getTime();
   const dayMs = 86_400_000;
   const t = date.getTime();
   if (t >= startOfToday) return 'today';
@@ -36,14 +42,12 @@ function bucketFor(date: Date): BucketKey {
   return 'older';
 }
 
-function formatThreadTime(date: Date, bucket: BucketKey): string {
-  if (bucket === 'today') {
-    return date.toLocaleTimeString(i18n.language, { hour: 'numeric', minute: '2-digit' });
-  }
-  if (bucket === 'week') {
-    return date.toLocaleDateString(i18n.language, { weekday: 'short' });
-  }
-  return date.toLocaleDateString(i18n.language, { month: 'short', day: 'numeric' });
+
+function formatThreadTime(date: Date, bucket: BucketKey, locale: string): string {
+  if (Number.isNaN(date.getTime())) return '';
+  if (bucket === 'today') return clockTime(date, locale);
+  if (bucket === 'week') return shortWeekday(date, locale);
+  return shortMonthDay(date, locale);
 }
 
 interface GroupedThreads {
@@ -57,30 +61,31 @@ function ThreadRow({
   onOpen,
   bucket,
   workspaceLabel,
-  isFlash,
+  isHome,
   instanceId,
 }: {
   thread: Thread;
   onOpen: () => void;
   bucket: BucketKey;
   workspaceLabel?: string;
-  isFlash?: boolean;
+  isHome?: boolean;
   instanceId: string;
 }) {
   const { t } = useTranslation();
+  const locale = useLocale();
   const title =
     thread.title ||
     ((thread as { first_query_content?: string }).first_query_content as string | undefined) ||
     t('dashboard.widgets.recentThreads.untitled');
   const updated = thread.updated_at ? new Date(thread.updated_at) : null;
-  const timeStr = updated ? formatThreadTime(updated, bucket) : '';
+  const timeStr = updated ? formatThreadTime(updated, bucket, locale) : '';
 
   return (
     <div className="row-attach-host relative">
     <button
       type="button"
       onClick={onOpen}
-      className="group relative w-full text-left flex items-center gap-3 py-2 pr-2 pl-3 rounded-md transition-all duration-150"
+      className="group relative w-full text-left flex items-center gap-3 py-2 pr-2 pl-3 rounded-md transition-all"
       onMouseEnter={(e) => {
         e.currentTarget.style.backgroundColor = 'var(--color-bg-hover)';
         const dot = e.currentTarget.querySelector('[data-dot]') as HTMLElement | null;
@@ -100,17 +105,16 @@ function ThreadRow({
         }
       }}
     >
-      {isFlash ? (
-        <Zap
-          className="h-3 w-3 flex-shrink-0"
+      {isHome ? (
+        <HomeRowIcon
+          className="h-3 w-3 shrink-0"
           style={{ color: 'var(--color-accent-primary)' }}
-          fill="currentColor"
         />
       ) : (
         <span
           data-dot
           aria-hidden
-          className="flex-shrink-0 rounded-full transition-all duration-200"
+          className="shrink-0 rounded-full transition-all"
           style={{
             width: 3,
             height: 3,
@@ -136,7 +140,7 @@ function ThreadRow({
       </span>
       {timeStr ? (
         <span
-          className="text-[0.6563rem] dashboard-mono uppercase tracking-wider tabular-nums flex-shrink-0 transition-colors self-start pt-[2px]"
+          className="text-[0.6563rem] dashboard-mono uppercase tracking-wider tabular-nums shrink-0 transition-colors self-start pt-[2px]"
           style={{ color: 'var(--color-text-tertiary)' }}
         >
           {timeStr}
@@ -165,7 +169,7 @@ function BucketSection({
   workspaceMap: Map<string, Workspace>;
   instanceId: string;
 }) {
-  const { t } = useTranslation();
+  const wsLabel = useWorkspaceLabel();
   if (threads.length === 0) return null;
   return (
     <div className="flex flex-col">
@@ -196,16 +200,14 @@ function BucketSection({
         {threads.map((thread) => {
           const wsId = (thread as { workspace_id?: string }).workspace_id;
           const ws = wsId ? workspaceMap.get(wsId) : undefined;
-          const isFlash = ws?.status === 'flash';
-          const workspaceLabel = ws?.name ?? (isFlash ? t('dashboard.widgets.recentThreads.flash') : undefined);
           return (
             <ThreadRow
               key={thread.thread_id}
               thread={thread}
               bucket={bucket}
               onOpen={() => onOpen(thread)}
-              workspaceLabel={workspaceLabel}
-              isFlash={isFlash}
+              workspaceLabel={wsLabel(ws)}
+              isHome={isHomeWorkspace(ws)}
               instanceId={instanceId}
             />
           );
@@ -217,6 +219,7 @@ function BucketSection({
 
 function RecentThreadsWidget({ instance }: WidgetRenderProps<RecentThreadsConfig>) {
   const { t } = useTranslation();
+  const label = useWorkspaceLabel();
   const navigate = useNavigate();
   const limit = instance.config.limit ?? 15;
   const scope = instance.config.workspaceId ?? 'all';
@@ -238,21 +241,18 @@ function RecentThreadsWidget({ instance }: WidgetRenderProps<RecentThreadsConfig
     return map;
   }, [wsListData]);
 
-  const { data, isLoading } = useQuery<ThreadsResponse>({
-    queryKey: isAllScope
-      ? queryKeys.threads.recent(limit)
-      : targetWorkspaceId
-        ? [...queryKeys.threads.byWorkspace(targetWorkspaceId), limit, 0]
-        : ['threads', 'noop'],
-    queryFn: () =>
-      (isAllScope
-        ? getRecentThreads(limit, 0)
-        : getWorkspaceThreads(targetWorkspaceId!, limit, 0)) as Promise<ThreadsResponse>,
-    enabled: isAllScope || !!targetWorkspaceId,
-    staleTime: 30_000,
-  });
+  const { data, isLoading } = useQuery(
+    isAllScope
+      ? {
+          queryKey: queryKeys.threads.recent(limit),
+          queryFn: () => getRecentThreads(limit, 0) as Promise<ThreadsResponse>,
+          staleTime: 30_000,
+        }
+      : { ...workspaceThreadsQuery(targetWorkspaceId ?? '', limit), enabled: !!targetWorkspaceId },
+  );
 
   const threads = useMemo(() => data?.threads ?? [], [data]);
+  const now = useNow();
 
   const grouped = useMemo<GroupedThreads>(() => {
     const out: GroupedThreads = { today: [], week: [], older: [] };
@@ -262,10 +262,10 @@ function RecentThreadsWidget({ instance }: WidgetRenderProps<RecentThreadsConfig
         out.older.push(thread);
         continue;
       }
-      out[bucketFor(d)].push(thread);
+      out[bucketFor(d, now)].push(thread);
     }
     return out;
-  }, [threads]);
+  }, [threads, now]);
 
   const handleOpen = (thread: Thread) => {
     navigate(`/chat/t/${thread.thread_id}`);
@@ -281,7 +281,7 @@ function RecentThreadsWidget({ instance }: WidgetRenderProps<RecentThreadsConfig
             th.title ||
             ((th as { first_query_content?: string }).first_query_content as string | undefined) ||
             t('dashboard.widgets.recentThreads.untitled'),
-          workspace: ws?.name ?? (ws?.status === 'flash' ? t('dashboard.widgets.recentThreads.flash') : ''),
+          workspace: isHomeWorkspace(ws) ? label(ws) : ws?.name ?? '',
           when: th.updated_at ?? '',
           thread_id: th.thread_id,
         };
@@ -361,7 +361,7 @@ function RecentThreadsWidget({ instance }: WidgetRenderProps<RecentThreadsConfig
       >
         <div className="flex items-baseline gap-2.5 min-w-0">
           <MessagesSquare
-            className="h-3.5 w-3.5 flex-shrink-0 self-center"
+            className="h-3.5 w-3.5 shrink-0 self-center"
             style={{ color: 'var(--color-text-tertiary)' }}
           />
           <span

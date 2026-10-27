@@ -1,6 +1,9 @@
 import { useState, useCallback, useEffect, useMemo, useRef, useSyncExternalStore } from 'react';
 import { useQueries, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useTranslation } from 'react-i18next';
+import { toast } from '@/components/ui/use-toast';
 import { useWorkspaces } from '../../../hooks/useWorkspaces';
+import { isHomeWorkspace } from '@/lib/homeWorkspace';
 import { CACHE_ONLY_META, queryKeys } from '../../../lib/queryKeys';
 import { createEmitter } from '@/lib/emitter';
 import { isArchivedThreadsKey, patchThreadRows, rollbackThreadRows } from '@/lib/threadRowActions';
@@ -12,17 +15,19 @@ import {
   type ThreadRecord,
   type ThreadsData,
 } from '@/lib/navThreadsStore';
-import type { ResourceTier, WorkspacesResponse } from '@/types/api';
+import type { ResourceTier, ThreadsResponse, Workspace, WorkspacesResponse } from '@/types/api';
 import { getWorkspaces, getWorkspaceThreads, reorderWorkspaces, updateThread } from '../utils/api';
-import { pinWorkspaceRow, renameWorkspaceRow } from './workspaceRowActions';
+import { workspaceThreadsQuery } from '../utils/threadQueries';
+import { pinWorkspaceRow, rankCachedWorkspaces, renameWorkspaceRow, unrankCachedWorkspaces } from './workspaceRowActions';
 import { useNavPrefs } from '../utils/navPrefs';
+import { denialMessage } from '../utils/denialMessage';
 
 /**
  * Workspace row as the nav tree consumes it: the fields the tree and its
  * options menu render, plus the loose tail the list endpoint carries. Exported
  * so hosts render the tree without re-casting the hook's output.
  */
-export interface NavWorkspace {
+export interface NavWorkspace extends Pick<Workspace, 'is_home'> {
   workspace_id: string;
   name?: string;
   status?: string;
@@ -37,18 +42,7 @@ export interface NavWorkspace {
 // the hook rather than reaching into the store module.
 export type { ThreadRecord, ThreadsData } from '@/lib/navThreadsStore';
 
-interface ThreadsResponse {
-  threads: ThreadRecord[];
-  total?: number;
-  [key: string]: unknown;
-}
-
-const NAV_WS_PARAMS = { limit: 20, includeFlash: true };
-
-// Page size is part of the key (mirrors the dashboard widgets' thread keys):
-// the queryFn fetches `pageSize` rows, so changing that pref must miss the
-// cache and refetch instead of replaying the previous page size.
-const threadPageKey = (wsId: string, pageSize: number) => [...queryKeys.threads.byWorkspace(wsId), pageSize, 0];
+const NAV_WS_PARAMS = { limit: 20, includeHome: true };
 
 // Session-stable nav ordering. The server sorts threads (and, within the
 // 'custom' workspace sort, unpinned workspaces) by updated_at DESC, so the item
@@ -74,9 +68,6 @@ export function resetStableNavOrder() {
   _frozenWorkspaceOrder = null;
   _lastWorkspaceArrangement.clear();
 }
-
-/** Parked subscription for a hook instance running with `enabled: false`. */
-const subscribeNever = (): (() => void) => () => {};
 
 // Drop a deleted workspace from the frozen-order stores so they don't retain
 // ghost ids for the rest of the session. Deleted ids are already filtered out
@@ -188,11 +179,27 @@ export function applyStableOrder(
 }
 
 // The workspace ordering rule: an unpinned workspace never renders above a
-// pinned one, and Flash counts as always-pinned — it can't be assumed to
+// pinned one, and Home counts as always-pinned. It can't be assumed to
 // carry is_pinned in every deployment, and pinned workspaces may still
 // outrank it inside the pinned block (by sort_order/recency).
-export function isEffectivelyPinned(ws: { workspace_id?: unknown; is_pinned?: unknown; status?: unknown }): boolean {
-  return Boolean(ws.is_pinned) || ws.status === 'flash';
+export function isEffectivelyPinned(ws: Pick<Workspace, 'is_home'> & { is_pinned?: unknown }): boolean {
+  return Boolean(ws.is_pinned) || isHomeWorkspace(ws);
+}
+
+/**
+ * Put the unpinned workspaces the server lists above every known unpinned one
+ * at the top of the frozen order. `applyStableOrderBy` tops only rows above
+ * every known row, and the pinned block (Home included) always leads the
+ * list, so a workspace created this session sank below the rest instead of
+ * opening the unpinned block, where a reload shows it. Rows paged in later
+ * still come below the known ones.
+ */
+function admitNewWorkspaces(frozen: string[], workspaces: NavWorkspace[]): string[] {
+  const known = new Set(frozen);
+  const unpinned = workspaces.filter((ws) => !isEffectivelyPinned(ws));
+  const firstKnown = unpinned.findIndex((ws) => known.has(ws.workspace_id));
+  const fresh = (firstKnown === -1 ? unpinned : unpinned.slice(0, firstKnown)).map((ws) => ws.workspace_id);
+  return fresh.length ? [...fresh, ...frozen] : frozen;
 }
 
 // Pinned block first, preserving relative (frozen) order within each block.
@@ -208,20 +215,11 @@ export function partitionPinnedFirst(threads: ThreadRecord[]): ThreadRecord[] {
   return [...pinned, ...rest];
 }
 
-export interface UseNavigationDataOptions {
-  /** Desktop ChatViews keep a mobile-only nav drawer mounted but never shown;
-   *  `false` parks this hook's queries and store subscriptions so five cached
-   *  views stop paying for a tree nobody renders. */
-  enabled?: boolean;
-}
-
-export function useNavigationData(currentWorkspaceId: string, { enabled = true }: UseNavigationDataOptions = {}) {
+export function useNavigationData(currentWorkspaceId: string) {
   const queryClient = useQueryClient();
+  const { t } = useTranslation();
   const { workspaceLimit, threadPageSize, orderBy } = useNavPrefs();
-  const orderVersion = useSyncExternalStore(
-    enabled ? navOrderEmitter.subscribe : subscribeNever,
-    () => _navOrderVersion,
-  );
+  const orderVersion = useSyncExternalStore(navOrderEmitter.subscribe, () => _navOrderVersion);
 
   // Pure: assembles the frozen order without writing it. The commit-phase
   // effect below owns every write to the snapshot (see absorbThreadOrder).
@@ -236,7 +234,7 @@ export function useNavigationData(currentWorkspaceId: string, { enabled = true }
 
   // Workspace list via React Query. sortBy mirrors the gallery's order-by
   // selection; changing it swaps the query key and refetches in the new order.
-  const wsParams = useMemo(() => ({ ...NAV_WS_PARAMS, sortBy: orderBy, enabled }), [orderBy, enabled]);
+  const wsParams = useMemo(() => ({ ...NAV_WS_PARAMS, sortBy: orderBy }), [orderBy]);
   const { data: wsData, isLoading } = useWorkspaces(wsParams);
   // Memoized so the `|| []` fallback doesn't hand every dependent memo/callback
   // a fresh array identity on each render.
@@ -249,10 +247,7 @@ export function useNavigationData(currentWorkspaceId: string, { enabled = true }
   // Loaded thread lists, read from the session-global shared store so every
   // cached panel sees the same data (see lib/navThreadsStore). Writes go
   // through setSharedWorkspaceThreads, which notifies all subscribed panels.
-  const workspaceThreads = useSyncExternalStore(
-    enabled ? subscribeNavThreads : subscribeNever,
-    getNavThreadsSnapshot,
-  );
+  const workspaceThreads = useSyncExternalStore(subscribeNavThreads, getNavThreadsSnapshot);
   // "Load all" clicked this session — overrides a numeric workspaceLimit pref.
   const [showAllWorkspaces, setShowAllWorkspaces] = useState(false);
   const showAll = workspaceLimit === 'all' || showAllWorkspaces;
@@ -265,7 +260,7 @@ export function useNavigationData(currentWorkspaceId: string, { enabled = true }
   // before the await, so two rapid taps would otherwise fetch the same page.
   const loadMoreInflightRef = useRef<Set<string>>(new Set());
   useEffect(() => {
-    if (!enabled || !showAll || isLoading) return;
+    if (!showAll || isLoading) return;
     if (!totalCount || allFetched.length >= totalCount) return;
     if (wsFetchRef.current.inflight || wsFetchRef.current.failed) return;
     wsFetchRef.current.inflight = true;
@@ -285,7 +280,7 @@ export function useNavigationData(currentWorkspaceId: string, { enabled = true }
       .finally(() => {
         wsFetchRef.current.inflight = false;
       });
-  }, [enabled, showAll, isLoading, allFetched.length, totalCount, queryClient, orderBy]);
+  }, [showAll, isLoading, allFetched.length, totalCount, queryClient, orderBy]);
 
   // Workspace list in server order (pinned first, then manual sort_order, then
   // recency), frozen to its first-session arrangement so the active workspace's
@@ -318,8 +313,9 @@ export function useNavigationData(currentWorkspaceId: string, { enabled = true }
         _lastWorkspaceArrangement.set(ws.workspace_id, { sortOrder, pinned });
       }
       if (manualOrderChanged) _frozenWorkspaceOrder = null;
+      const frozen = _frozenWorkspaceOrder && admitNewWorkspaces(_frozenWorkspaceOrder, allFetched);
 
-      const { order, items: stable } = applyStableOrderBy(_frozenWorkspaceOrder, allFetched, (ws) => ws.workspace_id);
+      const { order, items: stable } = applyStableOrderBy(frozen, allFetched, (ws) => ws.workspace_id);
       _frozenWorkspaceOrder = order;
       ordered = stable;
     } else {
@@ -331,10 +327,10 @@ export function useNavigationData(currentWorkspaceId: string, { enabled = true }
       ordered = allFetched;
     }
 
-    // Pinned block first (Flash counts as always-pinned), preserving relative
+    // Pinned block first (Home counts as always-pinned), preserving relative
     // order within each block — the workspace-tier partitionPinnedFirst. The
     // sources can't guarantee the invariant on their own: the frozen snapshot
-    // may predate a pin flip, and a flash row isn't guaranteed is_pinned in
+    // may predate a pin flip, and Home isn't guaranteed is_pinned in
     // the DB. Render-time (not baked into the freeze) so an optimistic pin
     // patch repositions the row instantly, like the thread partition.
     const pinnedBlock: NavWorkspace[] = [];
@@ -360,9 +356,9 @@ export function useNavigationData(currentWorkspaceId: string, { enabled = true }
   // Drag-reorder a workspace in the nav list. Optimistically rewrites the
   // frozen nav order, then persists sequential sort_order values so the
   // workspace gallery's 'custom' sort shows the same arrangement. Mirrors the
-  // gallery's reorder-mode rules: crossing the pinned/unpinned boundary is
+  // gallery grid's drag rules: crossing the pinned/unpinned boundary is
   // refused (the server sort would undo it — is_pinned DESC dominates
-  // sort_order); flash counts as pinned and reorders within that block.
+  // sort_order); Home counts as pinned and reorders within that block.
   const reorderWorkspace = useCallback(async (activeId: string, overId: string) => {
     const frozen = _frozenWorkspaceOrder;
     if (!frozen || !activeId || !overId || activeId === overId) return;
@@ -370,7 +366,7 @@ export function useNavigationData(currentWorkspaceId: string, { enabled = true }
     const active = byId.get(activeId);
     const over = byId.get(overId);
     if (!active || !over) return;
-    // No flash special case: it counts as pinned, so this boundary guard
+    // No Home special case: it counts as pinned, so this boundary guard
     // both contains it in the pinned block and keeps unpinned rows out.
     if (isEffectivelyPinned(active) !== isEffectivelyPinned(over)) return;
     const fromIdx = frozen.indexOf(activeId);
@@ -382,21 +378,27 @@ export function useNavigationData(currentWorkspaceId: string, { enabled = true }
     frozen.splice(toIdx, 0, activeId);
     bumpNavOrder();
 
-    // Flash is included: it's DB-pinned with a real sort_order, and writing
-    // its slot is what makes "pinned workspace above/below Flash" stick —
-    // omitting it leaves a sort_order tie decided by updated_at, so the
-    // pinned block would reshuffle whenever Flash is used.
+    // Home is included: it's DB-pinned with a real sort_order, and writing
+    // its slot is what makes "pinned workspace above/below Home" stick.
+    // Omitting it leaves a sort_order tie decided by updated_at, so the
+    // pinned block would reshuffle whenever Home is used.
     const items = frozen
       .map((id) => byId.get(id))
       .filter((ws): ws is NavWorkspace => !!ws)
       .map((ws, i) => ({ workspace_id: ws.workspace_id, sort_order: i }));
+    // Every cached list in the custom order takes the new order at once, the
+    // gallery's included, as a drop there does: a drag in the gallery before
+    // the save lands then moves from this order, not the one before it.
+    const previous = rankCachedWorkspaces(queryClient, items);
     try {
       await reorderWorkspaces(items);
       queryClient.invalidateQueries({ queryKey: queryKeys.workspaces.lists() });
     } catch (e) {
       console.warn('[useNavigationData] Failed to persist workspace order:', e);
+      unrankCachedWorkspaces(queryClient, previous);
       _frozenWorkspaceOrder = snapshot;
       bumpNavOrder();
+      queryClient.invalidateQueries({ queryKey: queryKeys.workspaces.lists() });
     }
   }, [allFetched, queryClient]);
 
@@ -407,11 +409,19 @@ export function useNavigationData(currentWorkspaceId: string, { enabled = true }
   }, [queryClient]);
 
   // Rename a workspace. No-op on blank/unchanged names is enforced by the caller.
+  // The inline field closes before the server answers, so a refusal (most
+  // often a taken name) can only be told in a toast.
   const renameWorkspace = useCallback((wsId: string, name: string) => {
     const trimmed = name.trim();
     if (!trimmed) return Promise.resolve(false);
-    return renameWorkspaceRow(queryClient, wsId, trimmed);
-  }, [queryClient]);
+    return renameWorkspaceRow(queryClient, wsId, trimmed, {
+      onError: (err) => toast({
+        variant: 'destructive',
+        title: t('workspace.renameFailed'),
+        description: denialMessage(err, t),
+      }),
+    });
+  }, [queryClient, t]);
 
   // Optimistically patch (or, with `remove`, drop) one thread row across every
   // cached list for the workspace — finite sidebar pages, the gallery's
@@ -464,11 +474,7 @@ export function useNavigationData(currentWorkspaceId: string, { enabled = true }
       // observers of their own.
       queryClient.invalidateQueries({ queryKey: queryKeys.threads.byWorkspace(wsId) });
       try {
-        await queryClient.fetchQuery({
-          queryKey: threadPageKey(wsId, threadPageSize),
-          queryFn: () => getWorkspaceThreads(wsId, threadPageSize, 0),
-          staleTime: 0,
-        });
+        await queryClient.fetchQuery({ ...workspaceThreadsQuery(wsId, threadPageSize), staleTime: 0 });
       } catch (e) {
         // Refetch failure: release the freeze anyway — re-snapshotting from
         // the optimistically patched cache beats a stuck frozen order.
@@ -502,21 +508,18 @@ export function useNavigationData(currentWorkspaceId: string, { enabled = true }
   }, [showAll, workspaceLimit, allFetched.length, totalCount]);
 
   const { isLoading: currentWsThreadsLoading } = useQuery({
-    queryKey: threadPageKey(currentWorkspaceId, threadPageSize),
-    queryFn: () => getWorkspaceThreads(currentWorkspaceId, threadPageSize, 0),
-    enabled: enabled && !!currentWorkspaceId,
-    staleTime: 30_000,
+    ...workspaceThreadsQuery(currentWorkspaceId, threadPageSize),
+    enabled: !!currentWorkspaceId,
   });
 
   // Every workspace whose page-0 rows this tree renders: the current one plus
   // whatever the shared "Show more" store retains. Sorted so the observer list
   // is stable across renders.
   const observedWsIds = useMemo(() => {
-    if (!enabled) return [];
     const ids = new Set(Object.keys(workspaceThreads));
     if (currentWorkspaceId) ids.add(currentWorkspaceId);
     return [...ids].sort();
-  }, [enabled, workspaceThreads, currentWorkspaceId]);
+  }, [workspaceThreads, currentWorkspaceId]);
 
   // Cache-ONLY observers over those exact page-0 keys. A patch to a row this
   // panel isn't otherwise subscribed to (a generated title landing for another
@@ -528,18 +531,27 @@ export function useNavigationData(currentWorkspaceId: string, { enabled = true }
   // lifecycle-feed resync — see CACHE_ONLY_META for what that opt-in attests to.
   const pageData = useQueries({
     queries: observedWsIds.map((wsId) => ({
-      queryKey: threadPageKey(wsId, threadPageSize),
-      queryFn: () => getWorkspaceThreads(wsId, threadPageSize, 0),
+      ...workspaceThreadsQuery(wsId, threadPageSize),
       enabled: false,
       meta: CACHE_ONLY_META,
-      staleTime: 30_000,
     })),
-    combine: (results) => results.map((r) => r.data as ThreadsResponse | undefined),
+    combine: (results) => results.map((r) => r.data),
   });
 
+  // Each workspace keeps its previous ThreadsData object while its rows are
+  // the same records: the sidebar rows are memoized on that identity, and a
+  // refetch that changed one thread used to rebuild every workspace's block.
+  const prevThreadsByWsRef = useRef<Record<string, ThreadsData>>({});
   const merged = useMemo(() => {
     const threadsByWs: Record<string, ThreadsData> = {};
     const orders: Record<string, string[]> = {};
+    const prev = prevThreadsByWsRef.current;
+    const keep = (wsId: string, next: ThreadsData): ThreadsData => {
+      const last = prev[wsId];
+      const same = !!last && last.loading === next.loading && last.total === next.total
+        && last.threads.length === next.threads.length && last.threads.every((t, i) => t === next.threads[i]);
+      return same ? last : next;
+    };
 
     // Every workspace group (not just the current one) renders page 0 read
     // through the query cache, with any "Show more" pages from the shared
@@ -553,7 +565,7 @@ export function useNavigationData(currentWorkspaceId: string, { enabled = true }
       const loading = (isCurrent && currentWsThreadsLoading) || stored?.loading || false;
       const page = pageData[index];
       if (page === undefined) {
-        threadsByWs[wsId] = { threads: stored?.threads || [], loading, total: stored?.total };
+        threadsByWs[wsId] = keep(wsId, { threads: stored?.threads || [], loading, total: stored?.total });
         return;
       }
       const pageThreads = page.threads || [];
@@ -561,9 +573,10 @@ export function useNavigationData(currentWorkspaceId: string, { enabled = true }
       const extras = (stored?.threads || []).filter((t) => !pageIds.has(t.thread_id));
       const { order, threads } = orderThreads(wsId, [...pageThreads, ...extras]);
       orders[wsId] = order;
-      threadsByWs[wsId] = { threads, loading, total: page.total ?? stored?.total };
+      threadsByWs[wsId] = keep(wsId, { threads, loading, total: page.total ?? stored?.total });
     });
 
+    prevThreadsByWsRef.current = threadsByWs;
     return { threadsByWs, orders };
   }, [observedWsIds, pageData, workspaceThreads, currentWorkspaceId, currentWsThreadsLoading, orderThreads]);
 
@@ -573,6 +586,10 @@ export function useNavigationData(currentWorkspaceId: string, { enabled = true }
   }, [merged]);
 
   const mergedThreads = merged.threadsByWs;
+  // Read by the handlers below at call time, so their identity does not
+  // follow the thread data: each is a prop of every memoized sidebar row.
+  const mergedThreadsRef = useRef(mergedThreads);
+  mergedThreadsRef.current = mergedThreads;
 
   const expandWorkspace = useCallback((wsId: string) => {
     const mergeFetched = (data: ThreadsResponse) => {
@@ -588,7 +605,8 @@ export function useNavigationData(currentWorkspaceId: string, { enabled = true }
       }));
     };
 
-    const cached = queryClient.getQueryData(threadPageKey(wsId, threadPageSize)) as ThreadsResponse | undefined;
+    const threadsKey = workspaceThreadsQuery(wsId, threadPageSize).queryKey;
+    const cached = queryClient.getQueryData(threadsKey);
     if (cached) {
       mergeFetched(cached);
       return;
@@ -599,13 +617,7 @@ export function useNavigationData(currentWorkspaceId: string, { enabled = true }
       [wsId]: { threads: prev[wsId]?.threads || [], loading: true, total: prev[wsId]?.total },
     }));
 
-    queryClient.fetchQuery({
-      queryKey: threadPageKey(wsId, threadPageSize),
-      queryFn: () => getWorkspaceThreads(wsId, threadPageSize, 0),
-      staleTime: 30_000,
-    }).then((data: unknown) => {
-      mergeFetched(data as ThreadsResponse);
-    }).catch(() => {
+    queryClient.fetchQuery(workspaceThreadsQuery(wsId, threadPageSize)).then(mergeFetched).catch(() => {
       setSharedWorkspaceThreads(prev => ({
         ...prev,
         [wsId]: { threads: prev[wsId]?.threads || [], loading: false, total: prev[wsId]?.total },
@@ -623,13 +635,13 @@ export function useNavigationData(currentWorkspaceId: string, { enabled = true }
   const loadMoreThreads = useCallback(async (wsId: string) => {
     if (loadMoreInflightRef.current.has(wsId)) return;
     loadMoreInflightRef.current.add(wsId);
-    const shown = mergedThreads[wsId]?.threads || [];
+    const shown = mergedThreadsRef.current[wsId]?.threads || [];
     setSharedWorkspaceThreads(prev => ({
       ...prev,
       [wsId]: {
         threads: prev[wsId]?.threads || shown,
         loading: true,
-        total: prev[wsId]?.total ?? mergedThreads[wsId]?.total,
+        total: prev[wsId]?.total ?? mergedThreadsRef.current[wsId]?.total,
       },
     }));
     try {
@@ -651,10 +663,9 @@ export function useNavigationData(currentWorkspaceId: string, { enabled = true }
       // back to the cache entry, which the render path treats as the authority
       // for both. Without this a stale cached total keeps the button alive
       // after the server list shrank (rows archived from another surface).
-      queryClient.setQueryData(threadPageKey(wsId, threadPageSize), (old: unknown) => {
-        const prev = old as ThreadsResponse | undefined;
-        return { ...(prev ?? {}), threads: pageRows.slice(0, threadPageSize), total: data.total ?? prev?.total };
-      });
+      queryClient.setQueryData(workspaceThreadsQuery(wsId, threadPageSize).queryKey, (prev) => ({
+        limit: threadPageSize, offset: 0, ...prev, threads: pageRows.slice(0, threadPageSize), total: data.total ?? prev?.total,
+      }));
       absorbThreadOrder(wsId, order);
       setSharedWorkspaceThreads(prev => ({
         ...prev,
@@ -673,7 +684,7 @@ export function useNavigationData(currentWorkspaceId: string, { enabled = true }
     } finally {
       loadMoreInflightRef.current.delete(wsId);
     }
-  }, [mergedThreads, threadPageSize, orderThreads, queryClient]);
+  }, [threadPageSize, orderThreads, queryClient]);
 
   const loadAll = useCallback(() => {
     // The page-in effect above fetches the remainder once this flips.

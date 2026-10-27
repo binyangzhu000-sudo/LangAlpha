@@ -1,10 +1,9 @@
 import { useTranslation } from 'react-i18next';
-import { AlertTriangle, Check, Minus, Monitor } from 'lucide-react';
-import { TagBadge } from '@/pages/ChatAgent/components/mcp/McpPrimitives';
-import type { McpToolSummary } from '@/pages/ChatAgent/utils/api';
+import { AlertTriangle, Check, Minus } from 'lucide-react';
 import type { Brokerage, CapabilityGroup } from '../brokerages';
 import { DetailField } from './DetailOverlay';
 import { RowNote } from './RowNote';
+import { NativeOnlyNote } from './DesktopDownloadLink';
 
 /**
  * The two sections a brokerage detail has that no other server does: what the
@@ -42,7 +41,7 @@ export function CapabilityList({
             <GrantGlyph on={on} settled={settled} />
             <div className="min-w-0">
               <p
-                className="text-xs font-medium"
+                className="text-sm font-medium"
                 style={{
                   color:
                     // Amber only where it is both real and granted. A declined
@@ -58,7 +57,7 @@ export function CapabilityList({
                 {t(`plugins.brokerages.capabilities.${group.key}.label`)}
               </p>
               <p
-                className="text-[0.6875rem] mt-0.5"
+                className="text-xs mt-0.5"
                 style={{
                   color: on
                     ? 'var(--color-text-tertiary)'
@@ -106,180 +105,13 @@ function GrantGlyph({ on, settled }: { on: boolean; settled: boolean }) {
       title={label}
       aria-label={label}
       role="img"
-      className="flex-shrink-0 mt-0.5"
+      className="shrink-0 mt-0.5"
       style={{
         color: on ? 'var(--color-text-secondary)' : 'var(--color-text-quaternary)',
       }}
     >
       <Icon className="h-3.5 w-3.5" />
     </span>
-  );
-}
-
-/**
- * The vendor's tools, under the consent group that reaches each one.
- *
- * Flat, the list answers "what does this broker publish". Grouped, it answers
- * the question someone actually opened this for: which of them can the agent
- * call right now. Discovery is deliberately unfiltered -- it is what the vendor
- * offers, not what this connection may do -- so a declined group's tools are
- * here and unreachable, and saying so is more useful than hiding them.
- */
-export function GroupedToolList({
-  groups,
-  granted,
-  tools,
-}: {
-  groups: CapabilityGroup[];
-  granted: string[] | null | undefined;
-  tools: McpToolSummary[];
-}) {
-  const { t } = useTranslation();
-  const settled = granted != null;
-  const byGroup = new Map<string, McpToolSummary[]>();
-  // Two trailing buckets, not one, because a tool outside every group is in one
-  // of two opposite states and the old single bucket asserted the wrong one for
-  // half of them. `always_denied` is a tool we read and deliberately withheld:
-  // refused whatever is granted. The rest are tools we have not classified,
-  // which the policy permits by design -- so they are the reachable ones, and
-  // drawing them dimmed under "Not available" told the reader the opposite of
-  // the truth on a screen about what an agent may do with a trading account.
-  const neverAvailable: McpToolSummary[] = [];
-  const unclassified: McpToolSummary[] = [];
-  for (const tool of tools) {
-    if (tool.capability) {
-      const bucket = byGroup.get(tool.capability);
-      if (bucket) bucket.push(tool);
-      else byGroup.set(tool.capability, [tool]);
-    } else if (tool.always_denied === false) {
-      unclassified.push(tool);
-    } else {
-      // Explicit false, not merely falsy. The field is absent on a backend that
-      // predates it, and that backend's policy was an allowlist -- under which
-      // an ungrouped tool was refused, not permitted. Reading `undefined` as
-      // permitted drew exactly those tools as callable for as long as a new
-      // page was talking to an old server.
-      neverAvailable.push(tool);
-    }
-  }
-
-  return (
-    <div className="flex flex-col gap-4">
-      {groups.map((group) => {
-        const bucket = byGroup.get(group.key) ?? [];
-        if (bucket.length === 0) return null;
-        const on = !settled || granted.includes(group.key);
-        return (
-          <div key={group.key} className="flex flex-col gap-1.5">
-            <div className="flex items-center gap-2 flex-wrap">
-              <span
-                className="text-[0.6875rem] font-medium"
-                style={{ color: 'var(--color-text-secondary)' }}
-              >
-                {t(`plugins.brokerages.capabilities.${group.key}.label`)}
-              </span>
-              <span
-                className="text-[0.6875rem]"
-                style={{ color: 'var(--color-text-quaternary)' }}
-              >
-                {bucket.length}
-              </span>
-              {settled && !on && (
-                <TagBadge soft>{t('plugins.brokerages.detail.declined')}</TagBadge>
-              )}
-            </div>
-            <ToolNames tools={bucket} dimmed={settled && !on} />
-          </div>
-        );
-      })}
-
-      <TrailingBucket
-        tools={neverAvailable}
-        label={t('plugins.brokerages.detail.neverAvailable')}
-        note={t('plugins.brokerages.detail.neverAvailableNote')}
-        dimmed
-      />
-      <TrailingBucket
-        tools={unclassified}
-        label={t('plugins.brokerages.detail.unclassified')}
-        // "The agent can still call them" is only true of a connection there is
-        // something to call with. With nothing connected the sentence promised
-        // reach the page had just finished saying does not exist.
-        note={t(
-          settled
-            ? 'plugins.brokerages.detail.unclassifiedNote'
-            : 'plugins.brokerages.detail.unclassifiedNoteUnconnected',
-        )}
-        // Not dimmed: these are the ones the agent can actually call.
-        dimmed={!settled}
-      />
-    </div>
-  );
-}
-
-/** A tool bucket that belongs to no consent group, with the reason it doesn't. */
-function TrailingBucket({
-  tools,
-  label,
-  note,
-  dimmed,
-}: {
-  tools: McpToolSummary[];
-  label: string;
-  note: string;
-  dimmed: boolean;
-}) {
-  if (tools.length === 0) return null;
-  return (
-    <div className="flex flex-col gap-1.5">
-      <div className="flex items-center gap-2 flex-wrap">
-        <span
-          className="text-[0.6875rem] font-medium"
-          style={{ color: 'var(--color-text-secondary)' }}
-        >
-          {label}
-        </span>
-        <span
-          className="text-[0.6875rem]"
-          style={{ color: 'var(--color-text-quaternary)' }}
-        >
-          {tools.length}
-        </span>
-      </div>
-      <p className="text-[0.6875rem]" style={{ color: 'var(--color-text-quaternary)' }}>
-        {note}
-      </p>
-      <ToolNames tools={tools} dimmed={dimmed} />
-    </div>
-  );
-}
-
-function ToolNames({
-  tools,
-  dimmed,
-}: {
-  tools: McpToolSummary[];
-  dimmed: boolean;
-}) {
-  return (
-    <div className="flex flex-wrap gap-1">
-      {tools.map((tool) => (
-        <span
-          key={tool.name}
-          title={tool.description || undefined}
-          className="text-[0.625rem] px-1.5 py-0.5 rounded break-all"
-          style={{
-            color: dimmed
-              ? 'var(--color-text-quaternary)'
-              : 'var(--color-text-tertiary)',
-            backgroundColor: 'var(--color-bg-tag)',
-            fontFamily: "'JetBrains Mono', 'Menlo', monospace",
-          }}
-        >
-          {tool.name}
-        </span>
-      ))}
-    </div>
   );
 }
 
@@ -327,7 +159,7 @@ export function BrokerFacts({
             </RowNote>
           )}
           {vendor.native_callback_only && (
-            <RowNote icon={Monitor}>{t('plugins.oauth.nativeOnlyNote')}</RowNote>
+            <NativeOnlyNote />
           )}
         </div>
       )}

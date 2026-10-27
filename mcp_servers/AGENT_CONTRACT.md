@@ -40,7 +40,7 @@ Rules:
 - **Timestamps** are exchange-local strings `"YYYY-MM-DD"` or `"YYYY-MM-DD HH:MM:SS"`,
   self-described by the envelope `timezone`.
 - **Prices are major units** of `currency` (pence/GBX converted to pounds, etc.).
-- **Symbols** go through `src.market_protocol.symbology` at the boundary; the echoed
+- **Symbols** go through `market_protocol.symbology` at the boundary; the echoed
   `symbol` is the canonical display spelling, regardless of what the caller passed.
 - **Interval vocab**: `1min|5min|15min|30min|1hour|4hour|1day|1week|1month`.
   Provider-native spellings (`1m`, `1wk`, `daily`, ...) are accepted as input aliases
@@ -105,7 +105,7 @@ Three sections, in order, moderate length (target ≤800 characters total):
 <0-2 lines: hard constraints — symbol formats, interval vocab, limits.>
 
 Args:
-    symbol: Ticker — US "AAPL", HK "0700.HK", A-share "600519.SS".
+    symbol: Ticker — US "AAPL", HK "0700.HK", A-share "600519.SH".
     interval: One of 1min|5min|15min|30min|1hour|4hour|1day.
 
 Returns:
@@ -153,3 +153,22 @@ test with a diff against the locked text. Rules of engagement:
   The pin test itself is read-only by design (it can never self-heal); the
   script is the lock's only writer. Commit the regenerated lock together with
   the docstring change so the diff shows both sides.
+
+## Exported tool list
+
+`mcp_servers/contract/market_data.tools.json` holds the `tools/list` of the four
+market-data servers (`price_data`, `fundamentals`, `macro`, `options`): each
+server's name and every tool's name, description, input schema and output
+schema, exactly as the SDK sends them. A deployment that serves these servers
+over HTTP from another implementation publishes this file as its tool list, so
+skills, prompts and generated wrappers see the same surface on either path.
+That implementation still has to return the envelope and row fields described
+above.
+
+`tests/unit/mcp_servers/test_market_data_tool_export.py` fails when the file no
+longer matches the servers. After an intentional tool change, regenerate it and
+commit it with the change:
+
+```bash
+uv run python scripts/utils/export_market_data_tools.py
+```

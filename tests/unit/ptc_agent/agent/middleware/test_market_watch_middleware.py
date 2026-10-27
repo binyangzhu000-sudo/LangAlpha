@@ -1,8 +1,11 @@
-"""MarketWatchMiddleware ephemeral injection behavior (awrap_model_call).
+"""MarketWatchMiddleware injection behavior (awrap_model_call).
 
-The middleware appends one `<market-watch>` HumanMessage to the model request
-via ``request.override`` — nothing enters durable state, so there is no
-carrier selection, no idempotency guard, and no projector strip to test.
+The middleware contributes one `<market-watch>` row under
+``REQUEST_CALL_UPDATES`` on the model request via ``request.override``. That
+key is request-only and never a state channel, so nothing enters durable state
+and there is no carrier selection, no idempotency guard, and no projector strip
+to test. The tail envelope owns the rendering and the cache breakpoint; neither
+is this middleware's concern any more.
 """
 
 import contextlib
@@ -10,13 +13,15 @@ import hashlib
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
+from zoneinfo import ZoneInfo
 
 import pytest
 import pytz
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-from ptc_agent.agent.middleware.market_watch import MarketWatchMiddleware
-from src.market_protocol import MarketPhase
+from ptc_agent.agent.middleware.market_watch import MarketWatchMiddleware, _any_venue_open
+from ptc_agent.agent.middleware.runtime_context import REQUEST_CALL_UPDATES
+from market_protocol import MarketPhase
 
 
 @pytest.fixture(autouse=True)
@@ -53,30 +58,31 @@ _SNAPS = [{"symbol": "NVDA", "price": 231.0, "change_percent": 2.31,
 
 
 class _FakeRequest:
-    """Minimal ModelRequest stand-in: messages + runtime + model + immutable override."""
+    """Minimal ModelRequest stand-in: messages + state + runtime + model + override."""
 
-    def __init__(self, messages, runtime=None, model=None):
+    def __init__(self, messages, runtime=None, model=None, state=None):
         self.messages = messages
         self.runtime = runtime or MagicMock()
         self.model = model
+        self.state = state if state is not None else {"messages": messages}
 
     def override(self, **overrides):
         return _FakeRequest(
             overrides.get("messages", self.messages),
             runtime=self.runtime,
             model=self.model,
+            state=overrides.get("state", self.state),
         )
 
 
-def _fake_calendar(phase):
-    """A calendar whose phase_at returns a fixed MarketPhase for the venue gate."""
-    cal = MagicMock()
-    cal.phase_at = MagicMock(return_value=phase)
-    return cal
+def _fake_clock(phase):
+    """An instrument clock whose phase is a fixed MarketPhase for the venue gate."""
+    clock = MagicMock()
+    clock.phase = MagicMock(return_value=phase)
+    return clock
 
 
 def _mw(interval=25, **kwargs):
-    kwargs.setdefault("cache_breakpoint_pin", True)
     return MarketWatchMiddleware(min_interval_seconds=interval, **kwargs)
 
 
@@ -102,7 +108,7 @@ def _patched(watchlist, snaps=_SNAPS, phase=MarketPhase.REGULAR, cfg=_CFG):
                   return_value=("REGULAR_HOURS", _FIXED_ET))
         )
         stack.enter_context(
-            patch(f"{_MOD}.get_calendar", return_value=_fake_calendar(phase))
+            patch(f"{_MOD}.clock_for_ref", return_value=_fake_clock(phase))
         )
         stack.enter_context(patch(f"{_MOD}.get_config", MagicMock(return_value=cfg)))
         yield SimpleNamespace(provider=provider)
@@ -120,19 +126,27 @@ def _batch_request(tool_msgs, tool_calls=None):
 
 
 def _assert_stamped(original, injected, count=1):
-    """Injected request = original messages + `count` ephemeral stamp tails."""
-    assert len(injected.messages) == len(original.messages) + count
-    assert injected.messages[: len(original.messages)] == original.messages
-    tail = injected.messages[-1]
-    assert isinstance(tail, HumanMessage)
-    assert tail.content.startswith("<market-watch>\n")
-    assert tail.content.endswith("\n</market-watch>")
+    """Injected request = same messages, plus `count` per-call rows.
+
+    Returns the newest row wrapped so ``.content`` reads like the stamp text
+    the assertions downstream care about.
+    """
+    # The stamp rides the request, never a message: the list passes through.
+    assert injected.messages == original.messages
+    rows = injected.state.get(REQUEST_CALL_UPDATES) or []
+    before = (original.state.get(REQUEST_CALL_UPDATES) or [])
+    assert len(rows) == len(before) + count
+    row = rows[-1]
+    assert row["kind"] == "market_watch"
+    assert row["schema_version"] == 1
+    assert row["text"].startswith("<market-watch>\n")
+    assert row["text"].endswith("\n</market-watch>")
     # Self-identifies as feed output so it can't be mistaken for the user.
-    assert "not a user message" in tail.content
-    # Tagged so history projection can drop the stamp by source, not just by
-    # content prefix (projector.py checks either).
-    assert tail.additional_kwargs.get("lc_source") == "market_watch"
-    return tail
+    assert "not a user message" in row["text"]
+    # Tagged so a reader can attribute the row without re-parsing its body.
+    assert row["provenance"]["source"] == "runtime_update"
+    assert row["provenance"]["writer"] == "market_watch"
+    return SimpleNamespace(content=row["text"], row=row)
 
 
 # --- ephemeral stamp ----------------------------------------------------------
@@ -267,7 +281,7 @@ async def test_watchlist_change_mid_window_refetches(recording_handler):
          patch(f"{_MOD}.get_market_data_provider", return_value=provider), \
          patch("src.tools.market_data.quote_format.get_market_session",
                return_value=("REGULAR_HOURS", _FIXED_ET)), \
-         patch(f"{_MOD}.get_calendar", return_value=_fake_calendar(MarketPhase.REGULAR)), \
+         patch(f"{_MOD}.clock_for_ref", return_value=_fake_clock(MarketPhase.REGULAR)), \
          patch(f"{_MOD}.get_config", MagicMock(return_value=_CFG)):
         first = _human_request()
         await mw.awrap_model_call(first, recording_handler)
@@ -293,9 +307,9 @@ async def test_venue_close_mid_window_stops_injection(recording_handler):
          patch(f"{_MOD}.get_market_data_provider", return_value=provider), \
          patch("src.tools.market_data.quote_format.get_market_session",
                return_value=("REGULAR_HOURS", _FIXED_ET)), \
-         patch(f"{_MOD}.get_calendar",
-               side_effect=[_fake_calendar(MarketPhase.REGULAR),
-                            _fake_calendar(MarketPhase.CLOSED)]), \
+         patch(f"{_MOD}.clock_for_ref",
+               side_effect=[_fake_clock(MarketPhase.REGULAR),
+                            _fake_clock(MarketPhase.CLOSED)]), \
          patch(f"{_MOD}.get_config", MagicMock(return_value=_CFG)):
         first = _human_request()
         await mw.awrap_model_call(first, recording_handler)
@@ -335,21 +349,38 @@ async def test_stamps_when_hk_open_while_us_closed(recording_handler):
     provider.get_snapshots = AsyncMock(return_value=hk_snaps)
     request = _human_request()
 
-    def _by_venue(calendar_id):
+    def _by_venue(ref):
         # XNYS closed, XHKG open.
-        return _fake_calendar(
-            MarketPhase.REGULAR if calendar_id == "XHKG" else MarketPhase.CLOSED
+        return _fake_clock(
+            MarketPhase.REGULAR if ref.calendar_id == "XHKG" else MarketPhase.CLOSED
         )
 
     with patch(f"{_MOD}.get_watchlist", AsyncMock(return_value=["AAPL", "0700.HK"])), \
          patch(f"{_MOD}.get_market_data_provider", return_value=provider), \
          patch("src.tools.market_data.quote_format.get_market_session",
                return_value=("CLOSED", _FIXED_ET)), \
-         patch(f"{_MOD}.get_calendar", side_effect=_by_venue), \
+         patch(f"{_MOD}.clock_for_ref", side_effect=_by_venue), \
          patch(f"{_MOD}.get_config", MagicMock(return_value=_CFG)):
         await mw.awrap_model_call(request, recording_handler)
 
     _assert_stamped(request, recording_handler.seen[0])
+
+
+@pytest.mark.parametrize(
+    "symbol,at,expected",
+    [
+        # A lunch break holds the morning close: nothing to stamp.
+        ("0700.HK", datetime(2026, 7, 2, 12, 30, tzinfo=ZoneInfo("Asia/Hong_Kong")), False),
+        ("0700.HK", datetime(2026, 7, 2, 10, 30, tzinfo=ZoneInfo("Asia/Hong_Kong")), True),
+        # After-hours moves a stock but not an index, which settled at 16:00.
+        ("AAPL", datetime(2026, 10, 1, 17, 30, tzinfo=ZoneInfo("America/New_York")), True),
+        ("^GSPC", datetime(2026, 10, 1, 17, 30, tzinfo=ZoneInfo("America/New_York")), False),
+    ],
+)
+def test_venue_gate_reads_each_instrument_clock(symbol, at, expected):
+    with patch(f"{_MOD}.datetime") as clock:
+        clock.now.return_value = at
+        assert _any_venue_open([symbol]) is expected
 
 
 @pytest.mark.asyncio
@@ -361,7 +392,7 @@ async def test_provider_failure_is_silent(recording_handler):
     provider.get_snapshots = AsyncMock(side_effect=RuntimeError("down"))
     with patch(f"{_MOD}.get_watchlist", AsyncMock(return_value=["NVDA"])), \
          patch(f"{_MOD}.get_market_data_provider", return_value=provider), \
-         patch(f"{_MOD}.get_calendar", return_value=_fake_calendar(MarketPhase.REGULAR)), \
+         patch(f"{_MOD}.clock_for_ref", return_value=_fake_clock(MarketPhase.REGULAR)), \
          patch(f"{_MOD}.get_config", MagicMock(return_value=_CFG)):
         result = await mw.awrap_model_call(request, recording_handler)
 
@@ -377,7 +408,7 @@ async def test_post_throttle_failure_is_silent(recording_handler):
     request = _human_request()
 
     with patch(f"{_MOD}.get_watchlist", AsyncMock(return_value=["NVDA"])), \
-         patch(f"{_MOD}.get_calendar", side_effect=RuntimeError("boom")), \
+         patch(f"{_MOD}.clock_for_ref", side_effect=RuntimeError("boom")), \
          patch(f"{_MOD}.get_config", MagicMock(return_value=_CFG)):
         result = await mw.awrap_model_call(request, recording_handler)
 
@@ -435,195 +466,6 @@ async def test_sse_symbols_are_watchlist_not_priced_subset(recording_handler):
     assert updates[0]["symbols"] == ["NVDA", "TSLA"]
 
 
-# --- anthropic cache breakpoint --------------------------------------------------
-
-
-def _anthropic_model():
-    from langchain_anthropic import ChatAnthropic
-
-    return ChatAnthropic(model="claude-sonnet-4-5", api_key="test-key")
-
-
-def _openai_model(**kwargs):
-    from langchain_openai import ChatOpenAI
-
-    return ChatOpenAI(model="gpt-5.6-sol", api_key="test-key", **kwargs)
-
-
-@pytest.mark.asyncio
-async def test_anthropic_durable_tail_gets_cache_breakpoint(recording_handler):
-    # The stamp evaporates from the next request, so the moving breakpoint must
-    # land on the last durable message — pinned via a request-scoped copy.
-    mw = _mw()
-    original = HumanMessage(content="What is NVDA doing?", id="h-1")
-    request = _FakeRequest([original], model=_anthropic_model())
-
-    with _patched(["NVDA"]):
-        await mw.awrap_model_call(request, recording_handler)
-
-    durable = recording_handler.seen[0].messages[-2]
-    assert durable is not original
-    assert durable.content == [
-        {
-            "type": "text",
-            "text": "What is NVDA doing?",
-            "cache_control": {"type": "ephemeral"},
-        }
-    ]
-    # The durable state message itself is never mutated.
-    assert original.content == "What is NVDA doing?"
-    assert isinstance(recording_handler.seen[0].messages[-1], HumanMessage)
-
-
-@pytest.mark.asyncio
-async def test_non_anthropic_durable_tail_untouched(recording_handler):
-    # cache_control is Anthropic wire format; other providers must not see it.
-    mw = _mw()
-    original = HumanMessage(content="What is NVDA doing?", id="h-1")
-    request = _FakeRequest([original], model=MagicMock())
-
-    with _patched(["NVDA"]):
-        await mw.awrap_model_call(request, recording_handler)
-
-    assert recording_handler.seen[0].messages[-2] is original
-
-
-@pytest.mark.asyncio
-async def test_cache_breakpoint_tags_last_text_block_of_list_content(recording_handler):
-    mw = _mw()
-    tool = ToolMessage(
-        content=[{"type": "text", "text": "part 1"}, {"type": "text", "text": "part 2"}],
-        tool_call_id="tc-1", name="web_search", id="tm-1",
-    )
-    ai = AIMessage(content="", tool_calls=[], id="ai-1")
-    request = _FakeRequest(
-        [HumanMessage(content="hi", id="h-0"), ai, tool], model=_anthropic_model()
-    )
-
-    with _patched(["NVDA"]):
-        await mw.awrap_model_call(request, recording_handler)
-
-    tagged = recording_handler.seen[0].messages[-2]
-    assert tagged.content[0] == {"type": "text", "text": "part 1"}
-    assert tagged.content[1] == {
-        "type": "text", "text": "part 2", "cache_control": {"type": "ephemeral"}
-    }
-    assert "cache_control" not in tool.content[1]
-
-
-@pytest.mark.asyncio
-async def test_cache_breakpoint_skips_non_text_tail_block(recording_handler):
-    # A durable message can end in a non-text block (image attachment); the
-    # marker must land on the last TEXT block, leaving the tail untouched —
-    # some providers reject cache markers on non-text blocks.
-    mw = _mw()
-    image_block = {"type": "image", "source": {"type": "base64", "data": "xx"}}
-    tool = ToolMessage(
-        content=[{"type": "text", "text": "part 1"}, image_block],
-        tool_call_id="tc-1", name="web_search", id="tm-1",
-    )
-    ai = AIMessage(content="", tool_calls=[], id="ai-1")
-    request = _FakeRequest(
-        [HumanMessage(content="hi", id="h-0"), ai, tool], model=_anthropic_model()
-    )
-
-    with _patched(["NVDA"]):
-        await mw.awrap_model_call(request, recording_handler)
-
-    tagged = recording_handler.seen[0].messages[-2]
-    assert tagged.content[0] == {
-        "type": "text", "text": "part 1", "cache_control": {"type": "ephemeral"}
-    }
-    assert tagged.content[1] == image_block
-    assert "cache_control" not in image_block
-
-
-@pytest.mark.asyncio
-async def test_cache_breakpoint_skips_untaggable_tail(recording_handler):
-    # An empty tool result has no block that accepts cache_control — degrade to
-    # no breakpoint (today's cache behavior), never a malformed request.
-    mw = _mw()
-    tool = ToolMessage(content="", tool_call_id="tc-1", name="web_search", id="tm-1")
-    ai = AIMessage(content="", tool_calls=[], id="ai-1")
-    request = _FakeRequest(
-        [HumanMessage(content="hi", id="h-0"), ai, tool], model=_anthropic_model()
-    )
-
-    with _patched(["NVDA"]):
-        await mw.awrap_model_call(request, recording_handler)
-
-    assert recording_handler.seen[0].messages[-2] is tool
-
-
-@pytest.mark.asyncio
-async def test_openai_official_with_cache_options_gets_breakpoint(recording_handler):
-    # OpenAI's explicit mode keys reads at provided breakpoints only, so the
-    # durable tail needs the same pin — with the OpenAI marker, not Anthropic's.
-    mw = _mw()
-    original = HumanMessage(content="What is NVDA doing?", id="h-1")
-    request = _FakeRequest(
-        [original],
-        model=_openai_model(
-            prompt_cache_options={"mode": "implicit"},
-            base_url="https://api.openai.com/v1",
-        ),
-    )
-
-    with _patched(["NVDA"]):
-        await mw.awrap_model_call(request, recording_handler)
-
-    durable = recording_handler.seen[0].messages[-2]
-    assert durable is not original
-    assert durable.content == [
-        {
-            "type": "text",
-            "text": "What is NVDA doing?",
-            "prompt_cache_breakpoint": {"mode": "explicit"},
-        }
-    ]
-    assert original.content == "What is NVDA doing?"
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "model_kwargs",
-    [
-        {},  # no prompt_cache_options opt-in
-        {  # opted in, but non-official endpoint (proxy) rejects the marker
-            "prompt_cache_options": {"mode": "implicit"},
-            "base_url": "https://proxy.example.com/v1",
-        },
-    ],
-)
-async def test_openai_without_optin_or_official_endpoint_untouched(
-    model_kwargs, recording_handler
-):
-    mw = _mw()
-    original = HumanMessage(content="What is NVDA doing?", id="h-1")
-    request = _FakeRequest([original], model=_openai_model(**model_kwargs))
-
-    with _patched(["NVDA"]):
-        await mw.awrap_model_call(request, recording_handler)
-
-    assert recording_handler.seen[0].messages[-2] is original
-
-
-@pytest.mark.asyncio
-async def test_cache_pin_flag_off_leaves_durable_tail_untouched(recording_handler):
-    mw = _mw(cache_breakpoint_pin=False)
-    original = HumanMessage(content="What is NVDA doing?", id="h-1")
-    request = _FakeRequest([original], model=_anthropic_model())
-
-    with _patched(["NVDA"]):
-        await mw.awrap_model_call(request, recording_handler)
-
-    # Stamp still appended; only the breakpoint pin is disabled.
-    seen = recording_handler.seen
-    assert seen[0].messages[-2] is original
-    assert isinstance(seen[0].messages[-1], HumanMessage)
-    assert seen[0].messages[-1].content.startswith("<market-watch>")
-
-
 # --- provenance ---------------------------------------------------------------
 
 
@@ -656,7 +498,7 @@ async def test_provenance_emitted_per_symbol_with_provider_attribution(recording
         ("NVDA", "ginlix-data"),
         ("TSLA", "market_data_proxy"),  # no per-snap source → generic fallback
     ]
-    stamp = recording_handler.seen[0].messages[-1].content
+    stamp = recording_handler.seen[0].state[REQUEST_CALL_UPDATES][-1]["text"]
     expected_sha = hashlib.sha256(stamp.encode("utf-8")).hexdigest()
     for e in prov:
         assert e["source_type"] == "market_data"
@@ -703,7 +545,7 @@ async def test_provenance_body_stored_once_per_block(body_store, recording_handl
         )
         await mw.aafter_agent(None, runtime)  # drains the background write
 
-    stamp = recording_handler.seen[0].messages[-1].content
+    stamp = recording_handler.seen[0].state[REQUEST_CALL_UPDATES][-1]["text"]
     body_store.assert_awaited_once_with(
         hashlib.sha256(stamp.encode("utf-8")).hexdigest(),
         stamp,

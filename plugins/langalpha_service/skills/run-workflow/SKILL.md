@@ -1,6 +1,6 @@
 ---
 name: run-workflow
-description: Orchestrate parallel subagent pipelines from a JavaScript workflow script — fan out work across many items (tickers, filings, findings) then synthesize, or run a saved workflow by name. Unlocks the RunWorkflow tool.
+description: Orchestrate parallel subagent pipelines from a JavaScript workflow script. Fan out work across many items (tickers, filings, findings) then synthesize, or run a saved workflow by name. Unlocks the RunWorkflow tool.
 ---
 
 # Programmatic Workflows (RunWorkflow)
@@ -83,4 +83,4 @@ Set `phase` per dispatch rather than calling `phase()` inside a stage: items run
 
 ## Running
 
-`RunWorkflow(script=..., params={...})` (or `script_path=...`, or `workflow="<name>"`) returns a task id immediately and runs in the background — continue other work, then poll `TaskOutput(task_id="...")` for progress or the final result (add `timeout=120` to block). Each dispatched child is a real background task: drill into a truncated result with `TaskOutput(task_id="<child task_id>")`. Run artifacts (per-child records, `result.json`) land under `.agents/threads/<thread>/workflows/<run-id>/`.
+`RunWorkflow(script=..., params={...})` (or `script_path=...`, or `workflow="<name>"`) returns a task id immediately and runs in the background. You are notified when the run finishes. Each dispatched child is a real background task: drill into a truncated result with `TaskOutput(task_id="<child task_id>")`. Run artifacts (per-child records, `result.json`) land under `.agents/threads/<thread>/workflows/<run-id>/`.

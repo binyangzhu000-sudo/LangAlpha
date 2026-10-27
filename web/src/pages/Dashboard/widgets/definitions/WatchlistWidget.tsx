@@ -1,4 +1,5 @@
-import { AnimatePresence, motion } from 'framer-motion';
+import { AnimatePresence } from '@/lib/framer';
+import { SwapCell } from '@/components/ui/crossfade';
 import { useTranslation } from 'react-i18next';
 import { Eye } from 'lucide-react';
 import { useDashboardContext } from '../framework/DashboardDataContext';
@@ -12,9 +13,11 @@ import {
 } from '../framework/snapshotSerializers';
 import { RowAttachButton } from '../../components/RowAttachButton';
 import type { WidgetRenderProps } from '../types';
+import { watchlistQuoteRow } from '../../hooks/useWatchlistData';
 import {
   HoldingsAddButton,
   HoldingsSkeleton,
+  useHoldingsSkeletonRows,
   WatchlistRowItem,
 } from './_holdingsPrimitives';
 
@@ -24,16 +27,12 @@ function WatchlistWidget({ instance }: WidgetRenderProps<WatchlistConfig>) {
   const { t } = useTranslation();
   const { watchlist, watchlistHandlers, dashboard } = useDashboardContext();
   const showSkeleton = watchlist.loading && watchlist.rows.length === 0;
+  const skeletonRows = useHoldingsSkeletonRows('watchlist', watchlist.loaded ? watchlist.rows.length : null);
 
   // Register snapshot exporters: full table + per-row.
   useWidgetContextExport(instance.id, {
     full: () => {
-      const rows = watchlist.rows.map((r) => ({
-        symbol: r.symbol,
-        price: r.quoteAvailable !== false ? r.price : undefined,
-        change: r.quoteAvailable !== false ? r.change : undefined,
-        changePercent: r.quoteAvailable !== false ? r.changePercent : undefined,
-      }));
+      const rows = watchlist.rows.map(watchlistQuoteRow);
       const body = serializeQuoteRowsToMarkdown(rows);
       const text = wrapWidgetContext('watchlist.list', { count: rows.length }, body);
       return {
@@ -55,12 +54,7 @@ function WatchlistWidget({ instance }: WidgetRenderProps<WatchlistConfig>) {
       // previousClose under the preMarket key would label yesterday's close
       // as the pre-market price in the agent's view. Adding correct ext-
       // hours info would need marketStatus + getExtendedHoursInfo here.
-      const cleaned = {
-        symbol: row.symbol,
-        price: row.quoteAvailable !== false ? row.price : undefined,
-        change: row.quoteAvailable !== false ? row.change : undefined,
-        changePercent: row.quoteAvailable !== false ? row.changePercent : undefined,
-      };
+      const cleaned = watchlistQuoteRow(row);
       const body = serializeQuoteRowToMarkdown(cleaned);
       const text = wrapWidgetContext('watchlist.list/row', { symbol: row.symbol }, body);
       return {
@@ -87,7 +81,7 @@ function WatchlistWidget({ instance }: WidgetRenderProps<WatchlistConfig>) {
       >
         <div className="flex items-baseline gap-2.5 min-w-0">
           <Eye
-            className="h-3.5 w-3.5 flex-shrink-0 self-center"
+            className="h-3.5 w-3.5 shrink-0 self-center"
             style={{ color: 'var(--color-text-tertiary)' }}
           />
           <span
@@ -96,34 +90,36 @@ function WatchlistWidget({ instance }: WidgetRenderProps<WatchlistConfig>) {
           >
             {t('dashboard.widgets.watchlist.header')}
           </span>
+          {/* Held but unseen while the rows load: a count of 0 that turns into
+              the real one reads as a change, not a load. */}
           <span
             className="title-font text-lg leading-none dashboard-mono"
-            style={{ color: 'var(--color-text-primary)' }}
+            style={{ color: 'var(--color-text-primary)', visibility: showSkeleton ? 'hidden' : undefined }}
           >
             {watchlist.rows.length}
           </span>
         </div>
       </div>
       <div className="flex-1 min-h-0 overflow-y-auto pr-1">
-        <AnimatePresence mode="wait">
-          <motion.div
-            key="watchlist"
-            initial={{ opacity: 0, y: 10 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: -10 }}
-            className="flex flex-col gap-1"
-          >
-            {showSkeleton ? (
-              <HoldingsSkeleton count={5} />
-            ) : (
-              watchlist.rows.map((row, i) => (
+        {/* The skeleton crossfades to the rows in place. Rows present when the
+            list first renders just are; only one added later enters. */}
+        <SwapCell
+          as="div"
+          className="items-start"
+          swapKey={showSkeleton ? 'loading' : 'ready'}
+          layerClassName="flex flex-col gap-1"
+        >
+          {showSkeleton ? (
+            <HoldingsSkeleton count={skeletonRows} />
+          ) : (
+            <AnimatePresence initial={false}>
+              {watchlist.rows.map((row) => (
                 <div
                   key={row.watchlist_item_id ?? row.symbol}
                   className="row-attach-host relative"
                 >
                   <WatchlistRowItem
                     item={row}
-                    index={i}
                     marketStatus={dashboard.marketStatus}
                     onDelete={watchlistHandlers.onDelete}
                   />
@@ -134,12 +130,12 @@ function WatchlistWidget({ instance }: WidgetRenderProps<WatchlistConfig>) {
                     />
                   </span>
                 </div>
-              ))
-            )}
+              ))}
+            </AnimatePresence>
+          )}
 
-            <HoldingsAddButton label={t('dashboard.widgets.watchlist.addSymbol')} onClick={watchlistHandlers.onAdd} />
-          </motion.div>
-        </AnimatePresence>
+          <HoldingsAddButton label={t('dashboard.widgets.watchlist.addSymbol')} onClick={watchlistHandlers.onAdd} />
+        </SwapCell>
       </div>
     </div>
   );

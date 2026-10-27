@@ -1,25 +1,31 @@
 import { useEffect, useState } from 'react';
-import { Trash2, MessageSquareText, FileText, Code2 } from 'lucide-react';
-import { useNavigate } from 'react-router-dom';
+import { Trash2, SlidersHorizontal, FileText, Code2 } from 'lucide-react';
+import { useNavigate } from 'react-router';
 import { clearPreferences } from '@/pages/Dashboard/utils/api';
-import { useUser } from '@/hooks/useUser';
 import { usePreferences } from '@/hooks/usePreferences';
 import { useUpdatePreferences } from '@/hooks/useUpdatePreferences';
 import { useQueryClient } from '@tanstack/react-query';
 import { queryKeys } from '@/lib/queryKeys';
 import { useTranslation } from 'react-i18next';
 import { useToast } from '@/components/ui/use-toast';
-import { getFlashWorkspace } from '@/pages/ChatAgent/utils/api';
+import { ToggleSwitch } from '@/components/ui/switch';
+import { readSubagentsDefault, subagentsDefaultPatch } from '@/lib/subagentsDefault';
 import ConfirmDialog from '@/pages/Dashboard/components/ConfirmDialog';
 import { useOnboarding } from '@/pages/Onboarding';
+import { welcomeUrl } from '@/pages/Onboarding/welcome/paths';
+import { useWelcomeOffer } from '@/pages/Onboarding/welcome/useWelcomeOffer';
 import type { Preferences } from './types';
+import { AutoApproveSettings } from './AutoApproveSettings';
+import { TradingPermissionSection } from './TradingPermissionSection';
 
-/** Preferences tab: investment-preference summary, output format, onboarding
- * replay/reset entry points, and the reset-preferences flow. */
+/** Preferences tab: investment-preference summary, output format, the
+ * subagents default that every thread without a value of its own follows,
+ * trading permission, onboarding replay/reset entry points, and the
+ * reset-preferences flow. */
 export function PreferencesTab() {
   const navigate = useNavigate();
   const { toast } = useToast();
-  const { user: authUser } = useUser();
+  const welcomeOffer = useWelcomeOffer();
   const { preferences: prefsData } = usePreferences();
   const updatePrefsMutation = useUpdatePreferences();
   const queryClient = useQueryClient();
@@ -58,44 +64,15 @@ export function PreferencesTab() {
     }
   };
 
-  const handleModifyPreferences = async () => {
+  const subagentsDefault = readSubagentsDefault(prefsData);
+  const handleSubagentsDefaultChange = async (next: boolean) => {
     try {
-      const flashWs = await getFlashWorkspace();
-      navigate(`/chat/t/__default__`, {
-        state: {
-          workspaceId: flashWs.workspace_id,
-          isModifyingPreferences: true,
-          agentMode: 'flash',
-          workspaceStatus: 'flash',
-        },
-      });
-    } catch (err) {
-      console.error('Error navigating to modify preferences:', err);
+      await updatePrefsMutation.mutateAsync(subagentsDefaultPatch(next));
+    } catch {
       toast({
         variant: 'destructive',
         title: t('common.error'),
-        description: t('dashboard.failedPrefUpdate'),
-      });
-    }
-  };
-
-  const handleStartOnboarding = async () => {
-    try {
-      const flashWs = await getFlashWorkspace();
-      navigate(`/chat/t/__default__`, {
-        state: {
-          workspaceId: flashWs.workspace_id,
-          isOnboarding: true,
-          agentMode: 'flash',
-          workspaceStatus: 'flash',
-        },
-      });
-    } catch (err) {
-      console.error('Error setting up onboarding:', err);
-      toast({
-        variant: 'destructive',
-        title: t('common.error'),
-        description: t('dashboard.failedOnboarding'),
+        description: t('settings.failedToSaveSettings'),
       });
     }
   };
@@ -106,6 +83,9 @@ export function PreferencesTab() {
       await clearPreferences();
       setPreferences(null);
       queryClient.invalidateQueries({ queryKey: queryKeys.user.preferences() });
+      // The reset also marks onboarding incomplete, and the welcome offer, the
+      // dashboard banner and the checklist read that off the user row.
+      queryClient.invalidateQueries({ queryKey: queryKeys.user.me() });
       // Feature overrides live in preferences too — refresh effective flags
       // so gated surfaces (Watch pill, Experiments toggles) update at once.
       queryClient.invalidateQueries({ queryKey: queryKeys.features.all });
@@ -144,7 +124,7 @@ export function PreferencesTab() {
   return (
     <>
     <div className="space-y-4">
-      {authUser?.onboarding_completed !== true && (
+      {welcomeOffer && (
         <div
           className="rounded-lg p-3 flex items-center justify-between gap-3"
           style={{
@@ -162,14 +142,14 @@ export function PreferencesTab() {
           </div>
           <button
             type="button"
-            onClick={handleStartOnboarding}
+            onClick={() => welcomeOffer.open()}
             className="shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm font-medium transition-opacity hover:opacity-90"
             style={{
               backgroundColor: 'var(--color-btn-primary-bg)',
               color: 'var(--color-btn-primary-text)',
             }}
           >
-            {t('settings.startOnboarding')}
+            <span>{welcomeOffer.label}</span>
           </button>
         </div>
       )}
@@ -192,7 +172,11 @@ export function PreferencesTab() {
                       {key.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase())}:
                     </span>
                     <span style={{ color: 'var(--color-text-primary)', wordBreak: 'break-word' }}>
-                      {typeof value === 'object' ? JSON.stringify(value) : String(value)}
+                      {Array.isArray(value)
+                        ? value.join(', ')
+                        : typeof value === 'object'
+                          ? JSON.stringify(value)
+                          : String(value)}
                     </span>
                   </div>
                 ))}
@@ -259,6 +243,25 @@ export function PreferencesTab() {
         );
       })()}
 
+      {/* The subagents default, which every thread without a value of its own follows */}
+      <div className="p-3 rounded-lg" style={{ backgroundColor: 'var(--color-bg-card)', border: '1px solid var(--color-border-muted)' }}>
+        <div className="flex items-center justify-between gap-3">
+          <label className="text-[0.8125rem] font-medium" style={{ color: 'var(--color-text-primary)' }}>
+            {t('settings.subagentsDefault')}
+          </label>
+          <ToggleSwitch
+            checked={subagentsDefault}
+            onChange={() => { void handleSubagentsDefaultChange(!subagentsDefault); }}
+            ariaLabel={t('settings.subagentsDefault')}
+          />
+        </div>
+        <p className="text-xs mt-2" style={{ color: 'var(--color-text-tertiary)' }}>
+          {t('settings.subagentsDefaultDesc')}
+        </p>
+      </div>
+      <AutoApproveSettings />
+      <TradingPermissionSection />
+
       {/* Column until there is room for a row. The two actions are a fixed
           ~259px whatever the viewport, so side-by-side on a phone leaves the
           description about 46px to wrap into and it shreds into a 150px-tall
@@ -281,7 +284,7 @@ export function PreferencesTab() {
             onClick={() => {
               if (replayGuides()) toast({ description: t('onboarding.settings.replayDone') });
             }}
-            className="px-2.5 py-1 rounded-md text-xs font-medium transition-opacity hover:opacity-80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-focus-ring)]"
+            className="px-2.5 py-1 rounded-md text-xs font-medium transition-opacity hover:opacity-80 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-(--color-focus-ring)"
             style={{ border: '1px solid var(--color-border-muted)', color: 'var(--color-text-secondary)' }}
           >
             {t('onboarding.settings.replayGuides')}
@@ -291,7 +294,7 @@ export function PreferencesTab() {
             onClick={() => {
               if (resetOnboarding()) toast({ description: t('onboarding.settings.resetDone') });
             }}
-            className="px-2.5 py-1 rounded-md text-xs font-medium transition-opacity hover:opacity-80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-focus-ring)]"
+            className="px-2.5 py-1 rounded-md text-xs font-medium transition-opacity hover:opacity-80 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-(--color-focus-ring)"
             style={{ border: '1px solid var(--color-border-muted)', color: 'var(--color-text-tertiary)' }}
           >
             {t('onboarding.settings.reset')}
@@ -318,19 +321,18 @@ export function PreferencesTab() {
         >
           <Trash2 className="h-4 w-4" /> {t('settings.resetPreferences')}
         </button>
-        <div className="flex items-center gap-3">
-          <button
-            type="button"
-            onClick={handleModifyPreferences}
-            className="flex items-center gap-2 px-3 py-1.5 rounded-md text-sm font-medium transition-opacity hover:opacity-90"
-            style={{
-              backgroundColor: 'var(--color-btn-primary-bg)',
-              color: 'var(--color-btn-primary-text)',
-            }}
-          >
-            <MessageSquareText className="h-4 w-4" /> {t('settings.modifyWithAgent')}
-          </button>
-        </div>
+        <button
+          type="button"
+          onClick={() => navigate(welcomeUrl({ edit: true }))}
+          className="flex items-center gap-2 px-3 py-1.5 rounded-md text-sm font-medium transition-opacity hover:opacity-90"
+          style={{
+            backgroundColor: 'var(--color-btn-primary-bg)',
+            color: 'var(--color-btn-primary-text)',
+          }}
+          data-testid="settings-edit-profile"
+        >
+          <SlidersHorizontal className="h-4 w-4" /> {t('onboarding.welcome.edit')}
+        </button>
       </div>
     </div>
 

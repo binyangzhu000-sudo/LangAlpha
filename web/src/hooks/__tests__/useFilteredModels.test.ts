@@ -6,6 +6,7 @@ import {
   buildConfiguredTypeMap,
   buildConfiguredSet,
   buildVisibleModels,
+  dropMissingModels,
 } from '../useFilteredModels';
 import type { ModelMetadataEntry } from '../useFilteredModels';
 import type { ConfiguredProvider } from '../useConfiguredProviders';
@@ -350,7 +351,7 @@ describe('augmentPlatformWithLocal', () => {
       { provider: 'anthropic', display_name: 'Anthropic', access_type: 'api_key' },
     ];
 
-    const result = augmentPlatformWithLocal(platform, providers);
+    const result = augmentPlatformWithLocal(platform, providers, true);
 
     expect(result.byok_providers).toEqual(['openai', 'anthropic']);
     expect(result.oauth_providers).toEqual([]);
@@ -363,15 +364,28 @@ describe('augmentPlatformWithLocal', () => {
       { provider: 'claude-oauth', display_name: 'Claude', access_type: 'oauth' },
     ];
 
-    const result = augmentPlatformWithLocal(platform, providers);
+    const result = augmentPlatformWithLocal(platform, providers, true);
 
     expect(result.oauth_providers).toEqual(['codex-oauth', 'claude-oauth']);
+  });
+
+  it('adds no stored key while the BYOK switch is off, and OAuth connections still', () => {
+    const platform = makePlatform();
+    const providers: ConfiguredProvider[] = [
+      { provider: 'anthropic', display_name: 'Anthropic', access_type: 'api_key' },
+      { provider: 'codex-oauth', display_name: 'Codex', access_type: 'oauth' },
+    ];
+
+    const result = augmentPlatformWithLocal(platform, providers, false);
+
+    expect(result.byok_providers).toEqual([]);
+    expect(result.oauth_providers).toEqual(['codex-oauth']);
   });
 
   it('returns unchanged platform when no local providers', () => {
     const platform = makePlatform({ byok_providers: ['openai'], oauth_providers: ['codex-oauth'] });
 
-    const result = augmentPlatformWithLocal(platform, []);
+    const result = augmentPlatformWithLocal(platform, [], true);
 
     expect(result.byok_providers).toEqual(['openai']);
     expect(result.oauth_providers).toEqual(['codex-oauth']);
@@ -505,6 +519,47 @@ describe('buildVisibleModels', () => {
     expect(result.customPairs.has('byok-variant::model-shared')).toBe(true);
   });
 
+  it('a shadowing custom entry is labeled by its own name, not the built-in it shadows', () => {
+    // The custom form's name is the label its author typed, and the entry may
+    // route to a different model_id than the built-in whose name it took, so
+    // the built-in's display_name must not follow it. What the model declares
+    // about itself still carries over.
+    const rawApiModels = {
+      'parent-prov': { models: ['model-shared', 'model-other'], display_name: 'Parent' },
+    };
+    const rawMetadata: Record<string, ModelMetadataEntry> = {
+      'model-shared': { provider: 'parent-prov', display_name: 'Model Shared', prompt_guidance: 'lean' },
+      'model-other': { provider: 'parent-prov', display_name: 'Model Other' },
+    };
+    const customModels = [
+      { name: 'model-shared', model_id: 'another-upstream-model', provider: 'byok-variant' },
+    ];
+
+    const result = buildVisibleModels(rawApiModels, rawMetadata, customModels, {}, null, []);
+
+    expect(result.metadata['model-shared'].display_name).toBeUndefined();
+    expect(result.metadata['model-shared'].prompt_guidance).toBe('lean');
+    expect(result.metadata['model-other'].display_name).toBe('Model Other');
+    // The API payload the metadata was copied from keeps its label.
+    expect(rawMetadata['model-shared'].display_name).toBe('Model Shared');
+  });
+
+  it('a shadowing custom entry offers no provider compaction', () => {
+    // The server compacts natively only on a client carrying the manifest's
+    // own request settings, which a custom entry never inherits, so the
+    // settings must not offer a choice that does nothing.
+    const rawApiModels = { 'parent-prov': { models: ['model-shared'], display_name: 'Parent' } };
+    const rawMetadata: Record<string, ModelMetadataEntry> = {
+      'model-shared': { provider: 'parent-prov', native_compaction: 'anthropic', prompt_guidance: 'lean' },
+    };
+    const customModels = [{ name: 'model-shared', model_id: 'model-shared', provider: 'byok-variant' }];
+
+    const result = buildVisibleModels(rawApiModels, rawMetadata, customModels, {}, null, []);
+
+    expect(result.metadata['model-shared'].native_compaction).toBeUndefined();
+    expect(result.metadata['model-shared'].prompt_guidance).toBe('lean');
+  });
+
   it('platform mode: filters by tier, custom models pass', () => {
     const rawApiModels = {
       openai: { models: ['gpt-4o', 'gpt-4o-mini'], display_name: 'OpenAI' },
@@ -600,7 +655,7 @@ describe('variant isolation (no brand_key promotion)', () => {
         access_type: 'coding_plan',
         brand_key: 'z-ai',
       },
-    ]);
+    ], true);
     expect(augmented.byok_providers).toContain('z-ai-coding');
     expect(augmented.byok_providers).not.toContain('z-ai');
   });
@@ -655,5 +710,65 @@ describe('oauth_plans gate', () => {
     } as unknown as PlatformModelsResponse;
     const result = buildVisibleModels(rawApiModels, rawMetadata, [], {}, platform, codexConnected('team'));
     expect(result.models.openai?.models).toEqual(['gpt-5.6-sol-oauth']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// dropMissingModels — a connection's own list hides what it cannot run
+// ---------------------------------------------------------------------------
+
+describe('dropMissingModels', () => {
+  const metadata: Record<string, ModelMetadataEntry> = {
+    'gpt-a': { provider: 'codex-oauth', access_type: 'oauth' },
+    'gpt-spark': { provider: 'codex-oauth', access_type: 'oauth' },
+    'sonnet': { provider: 'anthropic', access_type: 'api_key' },
+    'mine': { provider: 'codex-oauth', is_custom_model: true },
+  };
+  const map = makeProviderMap({ 'codex-oauth': ['gpt-a', 'gpt-spark', 'mine'], anthropic: ['sonnet'] });
+
+  it('hides the missing models of a provider whose list was read', () => {
+    const out = dropMissingModels(map, metadata, new Map([['codex-oauth', new Set(['gpt-spark'])]]));
+    expect(out['codex-oauth'].models).toEqual(['gpt-a', 'mine']);
+    expect(out.anthropic.models).toEqual(['sonnet']);
+  });
+
+  it('changes nothing when no list was read (fail open)', () => {
+    expect(dropMissingModels(map, metadata, new Map())).toBe(map);
+  });
+
+  it("keeps a model the user added, and a group-scoped custom pair, whatever the list says", () => {
+    const missing = new Map([['codex-oauth', new Set(['mine', 'gpt-a'])]]);
+    const pairs = new Set(['codex-oauth::gpt-a']);
+    expect(dropMissingModels(map, metadata, missing, pairs)['codex-oauth'].models).toEqual(['gpt-a', 'gpt-spark', 'mine']);
+  });
+
+  it('runs inside buildVisibleModels, after the custom merge', () => {
+    const configured = [{ provider: 'codex-oauth', display_name: 'ChatGPT', access_type: 'oauth' as const }];
+    const result = buildVisibleModels(
+      { 'codex-oauth': { models: ['gpt-a', 'gpt-spark'] } },
+      metadata,
+      [],
+      {},
+      null,
+      configured,
+      new Map([['codex-oauth', new Set(['gpt-spark'])]]),
+    );
+    expect(result.models['codex-oauth'].models).toEqual(['gpt-a']);
+    // The pre-filter snapshot still carries it, for the screens that list the whole manifest.
+    expect(result.rawModels['codex-oauth'].models).toContain('gpt-spark');
+  });
+
+  it("drops a brand's model picked under a plan once the plan's own list stops serving it", () => {
+    // The pick is saved as an entry naming the plan, only so the plan's key
+    // runs it; it is the same model, so the plan's list still decides. One the
+    // user described under the same name, as another model, stays theirs.
+    const meta: Record<string, ModelMetadataEntry> = { 'glm-x': { provider: 'z-ai', model_id: 'glm-x' } };
+    const configured = [{ provider: 'z-ai-coding', display_name: 'GLM Coding', access_type: 'coding_plan' as const }];
+    const missing = new Map([['z-ai-coding', new Set(['glm-x'])]]);
+    const build = (model_id: string) => buildVisibleModels(
+      {}, meta, [{ name: 'glm-x', model_id, provider: 'z-ai-coding' }], {}, null, configured, missing,
+    );
+    expect(build('glm-x').models['z-ai-coding']?.models ?? []).toEqual([]);
+    expect(build('glm-x-house').models['z-ai-coding']?.models).toEqual(['glm-x']);
   });
 });

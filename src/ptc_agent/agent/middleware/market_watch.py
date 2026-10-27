@@ -1,23 +1,23 @@
 """Market watch middleware: injects live prices for watched tickers.
 
-One ephemeral `<market-watch>` block is appended to each model request's messages
-(``awrap_model_call`` + ``request.override``) — it reaches the provider but never
-enters durable state, so checkpoints, replay, and history stay clean. An in-memory
-throttle re-injects the cached block between refreshes so the model keeps a price
-view without a provider fetch every call, and a skip-when-already-quoted guard
-keeps the fetch off the hot path; any failure degrades to injecting nothing so the
+One `<market-watch>` block is contributed per model request as a row under
+``REQUEST_CALL_UPDATES`` on the request state (``awrap_model_call`` +
+``request.override``), and the tail envelope renders it. That key is
+request-only and never a state channel, so the stamp reaches the provider but
+never enters durable state and checkpoints, replay, and history stay clean. An in-memory throttle
+re-injects the cached block between refreshes so the model keeps a price view
+without a provider fetch every call, and a skip-when-already-quoted guard keeps
+the fetch off the hot path; any failure degrades to contributing nothing so the
 turn is never broken.
 
-For breakpoint-keyed caches (Anthropic always; OpenAI official endpoint with
-``prompt_cache_options``) a cache breakpoint is pinned to the last durable message
-so the ephemeral tail doesn't defeat incremental prompt caching — this middleware
-must therefore sit inside model_resilience (it needs the post-fallback model to
-gate the provider-specific marker).
+This middleware must sit OUTSIDE ``TailEnvelopeMiddleware``, which reads the
+request key it writes, and it owns no cache breakpoint of its own: the envelope
+carries the whole volatile tail and pins the breakpoint there.
 
 Every injection is also attested in the turn's provenance stream (one
-``market_data`` record per watched symbol) — provenance rides sse_events
-persistence, so it records what the model saw even though the stamp itself is
-never checkpointed.
+``market_data`` record per watched symbol). Provenance is recorded beside the
+turn, so it keeps what the model saw even though the stamp itself is never
+checkpointed.
 """
 
 import inspect
@@ -38,22 +38,20 @@ from ptc_agent.agent.middleware.provenance.body_store import (
     schedule_body_write,
     store_body,
 )
-from ptc_agent.agent.middleware.provider_cache import (
-    breakpoint_marker,
-    tag_last_text_block,
+from ptc_agent.agent.middleware.runtime_context import (
+    REQUEST_CALL_UPDATES,
+    RUNTIME_UPDATE_SOURCE,
+    DurableUpdate,
 )
 from ptc_agent.agent.provenance.types import (
     ProvenanceSource,
     build_provenance_event,
     fingerprint_result_with_body,
 )
-from src.config.settings import (
-    get_market_watch_cache_pin,
-    get_market_watch_min_interval,
-)
+from src.config.settings import get_market_watch_min_interval
+from src.data_client.instrument_clock import clock_for_ref
 from src.data_client.registry import get_market_data_provider
-from src.market_protocol import MarketPhase
-from src.market_protocol.calendars import get_calendar
+from market_protocol import AssetClass, MarketPhase
 from src.tools.market_data.display import resolve_ref
 from src.tools.market_data.quote_format import current_price, format_quote_block
 from src.utils.market_watch import get_watchlist
@@ -63,27 +61,18 @@ logger = logging.getLogger(__name__)
 _STAMP_OPEN = "<market-watch>"
 _STAMP_CLOSE = "</market-watch>"
 _STAMP_NOTE = "Automated live-price feed (not a user message)."
+# Bump when the block's shape changes: a row outlives the code that wrote it.
+_STAMP_SCHEMA_VERSION = 1
+
+# Phases in which a watched price can move. A lunch break holds the morning
+# close and an index's extended hours hold the regular close, so a stamp then
+# would only repeat a price the venue is not changing.
+_MOVING_PHASES = (MarketPhase.PRE, MarketPhase.REGULAR, MarketPhase.POST)
 
 # Direct tools whose call already puts a fresh price for the symbol in front of
 # the model; when the current batch has one for a watched ticker we skip the
 # redundant injection. A stale/renamed entry only loses this optimization.
 _QUOTE_TOOL_NAMES = {"get_quote", "get_company_overview"}
-
-
-def _pin_cache_breakpoint(msg: Any, key: str, marker: dict[str, Any]) -> Any:
-    """Request-scoped copy of ``msg`` with ``key: marker`` on its last text block.
-
-    Delegates the str-vs-list tagging to the shared helper; returns ``msg``
-    unchanged when there's no text tail to tag or the copy fails — worse caching,
-    never a bad request.
-    """
-    try:
-        new_content = tag_last_text_block(msg.content, key, marker)
-    except Exception:
-        return msg
-    if new_content is None:
-        return msg
-    return msg.model_copy(update={"content": new_content})
 
 
 def _configurable() -> dict:
@@ -95,20 +84,21 @@ def _configurable() -> dict:
 
 
 def _any_venue_open(symbols: list[str]) -> bool:
-    """True if any watched symbol's listing venue is not CLOSED.
+    """True if any watched symbol's price can be moving now.
 
-    Each symbol is priced against its own exchange calendar, so a watchlist of
-    only ``0700.HK`` stamps during Hong Kong hours even while US markets are
-    shut. An unresolvable symbol counts as open (fail-open → proceed to fetch);
-    a calendar lookup that raises propagates to the injection guard, which
-    degrades to injecting nothing.
+    Each symbol is read on its own instrument clock, so a watchlist of only
+    ``0700.HK`` stamps during Hong Kong hours even while US markets are shut,
+    and goes quiet over its lunch break. An unresolvable symbol counts as open
+    (fail-open → proceed to fetch); a clock lookup that raises propagates to
+    the injection guard, which degrades to injecting nothing. Symbols read as
+    the stocks they are fetched as, so a watched COMP is the company.
     """
     now = datetime.now(timezone.utc)
     for sym in symbols:
-        ref = resolve_ref(sym)
+        ref = resolve_ref(sym, AssetClass.EQUITY)
         if ref is None:
             return True
-        if get_calendar(ref.calendar_id).phase_at(now) != MarketPhase.CLOSED:
+        if clock_for_ref(ref).phase(now) in _MOVING_PHASES:
             return True
     return False
 
@@ -166,25 +156,16 @@ def _batch_quotes_watched(
 class MarketWatchMiddleware(AgentMiddleware):
     """Injects live prices for watched tickers; no-op when the watch list is empty.
 
-    Appends one ephemeral `<market-watch>` HumanMessage per model call via
-    ``request.override`` — nothing is persisted. Any failure (Redis, provider,
-    formatting) degrades to injecting nothing; it must never break the turn.
+    Contributes one `<market-watch>` row per model call via
+    ``request.override``; nothing is persisted. Any failure (Redis, provider,
+    formatting) degrades to contributing nothing; it must never break the turn.
     """
 
-    def __init__(
-        self,
-        min_interval_seconds: int | None = None,
-        cache_breakpoint_pin: bool | None = None,
-    ) -> None:
+    def __init__(self, min_interval_seconds: int | None = None) -> None:
         self._min_interval = (
             min_interval_seconds
             if min_interval_seconds is not None
             else get_market_watch_min_interval()
-        )
-        self._cache_pin = (
-            cache_breakpoint_pin
-            if cache_breakpoint_pin is not None
-            else get_market_watch_cache_pin()
         )
         # awrap_model_call runs once per model call, sequentially — no lock needed.
         self._last_injected_at: float | None = None
@@ -210,24 +191,26 @@ class MarketWatchMiddleware(AgentMiddleware):
         stamp = await self._stamp_for(request.messages, request.runtime)
         if stamp is None:
             return await handler(request)
-        # lc_source lets history projection drop the stamp by tag, not just by
-        # content prefix, if the ephemeral invariant ever regresses.
-        messages = [
-            *request.messages,
-            HumanMessage(
-                content=stamp, additional_kwargs={"lc_source": "market_watch"}
-            ),
+        # Request-scoped state, not a state update: the row is handed to the
+        # tail envelope for this one call and is never written back, which is
+        # what keeps the stamp out of checkpoints, replay, and history.
+        state = dict(getattr(request, "state", None) or {})
+        update = DurableUpdate(
+            kind="market_watch",
+            schema_version=_STAMP_SCHEMA_VERSION,
+            text=stamp,
+            provenance={
+                "source": RUNTIME_UPDATE_SOURCE,
+                "writer": "market_watch",
+                "symbols": sorted(self._last_symbols),
+                "fetched_at": self._last_fetch_ts,
+            },
+        )
+        state[REQUEST_CALL_UPDATES] = [
+            *(state.get(REQUEST_CALL_UPDATES) or []),
+            update.to_dict(),
         ]
-        # Breakpoint-keyed caches (Anthropic; OpenAI explicit mode) write their
-        # incremental entry at the request tail — the ephemeral stamp, a message
-        # the next request doesn't contain at that position — so history would
-        # be re-read uncached on every call. Pin a breakpoint on the last
-        # durable message instead; only the stamp itself stays uncached.
-        if self._cache_pin:
-            marker = breakpoint_marker(getattr(request, "model", None))
-            if marker is not None:
-                messages[-2] = _pin_cache_breakpoint(messages[-2], *marker)
-        return await handler(request.override(messages=messages))
+        return await handler(request.override(state=state))
 
     async def _stamp_for(
         self, messages: list[Any] | None, runtime: Any
@@ -263,7 +246,7 @@ class MarketWatchMiddleware(AgentMiddleware):
         # turn. Inner `return None`s below are normal control flow.
         try:
             # Venue gate: stamp when ANY watched symbol's exchange is open. Pure
-            # CPU (symbol resolve + calendar phase). Above the throttle so a
+            # CPU (symbol resolve + clock phase). Above the throttle so a
             # mid-window venue close stops the cached replay.
             if not _any_venue_open(symbols):
                 return None
@@ -328,7 +311,9 @@ class MarketWatchMiddleware(AgentMiddleware):
             )
             if not snaps:
                 return None
-            block = format_quote_block(snaps, prev_prices=self._last_prices)
+            block = format_quote_block(
+                snaps, prev_prices=self._last_prices, asset_class=AssetClass.EQUITY
+            )
         except Exception:
             logger.warning("[MarketWatch] snapshot fetch failed", exc_info=True)
             return None

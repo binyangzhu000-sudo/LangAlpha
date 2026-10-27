@@ -57,13 +57,18 @@ body > :first-child {
  * The widget is a separate document, so it inherits none of the app's chrome and
  * draws the platform's default scrollbar: a bright slab against a dark surface.
  * Applies to both variants — an inline widget with its own scrolling table shows
- * the same one. Matches `styles/tokens.css`; keep them in step.
+ * the same one. Matches `styles/tokens.css`; keep them in step. A widget with
+ * WebKit scrollbar rules of its own gets none of it: the two would merge rule by
+ * rule, and a 6px scrollbar less this 3px inset on each side paints no thumb at
+ * all. `scrollbar-width` and `scrollbar-color` cannot merge that way, so a
+ * widget that sets only those still gets it, and a browser without them shows it.
  */
 const SCROLLBARS = `
-::-webkit-scrollbar { width: 8px; height: 8px; }
-::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: var(--color-border-elevated); border-radius: 4px; }
-::-webkit-scrollbar-thumb:hover { background: var(--color-text-tertiary); }`;
+::-webkit-scrollbar { width: 12px; height: 12px; }
+::-webkit-scrollbar-track { background: transparent; margin: 4px; }
+::-webkit-scrollbar-thumb { background-color: var(--color-border-elevated); background-clip: padding-box; border: 3px solid transparent; border-radius: 6px; }
+::-webkit-scrollbar-thumb:hover { background-color: var(--color-text-tertiary); }`;
+const STYLES_OWN_SCROLLBAR = /-webkit-scrollbar/i;
 
 /**
  * Fullscreen caps at the chat column the widget was authored for and centres in
@@ -147,6 +152,11 @@ export function buildHtmlSrcDoc(
 
   // Injected before any widget code runs:
   // 1. Patch JSON.parse to handle NaN/Infinity from Python's json.dumps (not valid JSON).
+  //    Quoted strings are left untouched: a flat token scan with a per-parse
+  //    inString flag, so there is no repetition for the regexp engine to
+  //    backtrack over and a very long string cannot exhaust its stack. Text
+  //    with neither spelling skips the scan: the patch is global to the iframe,
+  //    so every other parse (chart libraries included) would pay for it.
   // 2. Catch uncaught errors and unhandled rejections, display an inline error overlay.
   // 3. Route link clicks to window.open(..., 'noopener'): a plain <a href>
   //    navigates the IFRAME itself, rendering the target inside the sandbox
@@ -155,7 +165,13 @@ export function buildHtmlSrcDoc(
 (function(){
   var _p=JSON.parse;
   JSON.parse=function(t,r){
-    if(typeof t==='string')t=t.replace(/\\bNaN\\b/g,'null').replace(/(?<![A-Za-z_])-?Infinity\\b/g,'null');
+    if(typeof t==='string'&&(t.indexOf('NaN')!==-1||t.indexOf('Infinity')!==-1)){
+      var inString=false;
+      t=t.replace(/\\\\[\\s\\S]|"|(?<!\\w)(?:NaN|-?Infinity)\\b/g,function(token){
+        if(token==='"'){inString=!inString;return token;}
+        return inString||token.charAt(0)==='\\\\'?token:'null';
+      });
+    }
     return _p.call(this,t,r);
   };
   var shown={},count=0,rendering=false;
@@ -211,7 +227,7 @@ export function buildHtmlSrcDoc(
 }
 *, *::before, *::after { box-sizing: border-box; }
 body { margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; color: var(--color-text-primary); background: transparent; ${VARIANTS[variant].bodyOverflow} }
-${VARIANTS[variant].layout}\n${SCROLLBARS}
+${VARIANTS[variant].layout}\n${STYLES_OWN_SCROLLBAR.test(html) ? '' : SCROLLBARS}
 </style>
 ${earlyScripts}${dataScript}<script>
 window.sendPrompt = function(text) {

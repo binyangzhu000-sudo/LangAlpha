@@ -5,11 +5,9 @@
  *     - retrying → "<model> error — retrying ({attempt+1}/{maxRetries+1})…"
  *     - fallback → "Falling back to <toModel>…"
  *   - FallbackSuggestionPill: rendered only when `fallbackSuggestion &&
- *     !isLoading && toModel !== nextSendModel`, with a switch action and a
- *     dismiss. `nextSendModel = inputModel ?? (lastThreadModel ||
- *     activePreferredModel)` — the chat input's live selection (what the next
- *     send re-uses), NOT the durable preference, which a thread's own model
- *     overrides on every send.
+ *     !isLoading && toModel !== composerModel`, with a switch action and a
+ *     dismiss. `composerModel` is the model the composer shows, which is what
+ *     the next send names.
  *
  * Copy is asserted through the real i18n instance (global test setup) against
  * the chat.modelRetrying / chat.modelFallingBack / chat.modelTroubleSuggestion
@@ -72,9 +70,7 @@ describe('FallbackSuggestionPill', () => {
       <FallbackSuggestionPill
         fallbackSuggestion={suggestion}
         isLoading={false}
-        inputModel={null}
-        lastThreadModel={null}
-        activePreferredModel="model-alpha"
+        composerModel="model-alpha"
         onSwitchModel={noop}
         onDismiss={noop}
         {...overrides}
@@ -103,42 +99,13 @@ describe('FallbackSuggestionPill', () => {
     expect(container.firstChild).toBeNull();
   });
 
-  it('renders nothing when the preference resolves to the working model and nothing overrides it', () => {
-    const { container } = renderPill({ activePreferredModel: 'model-beta' });
-    expect(container.firstChild).toBeNull();
-  });
-
-  it('still renders when the durable preference is the working model but the input re-sends the broken one', () => {
-    // Regression: the thread's own model (input selection) overrides the
-    // preference on every send — a "correct" preference must not hide the pill.
-    renderPill({
-      inputModel: 'model-alpha',
-      lastThreadModel: 'model-alpha',
-      activePreferredModel: 'model-beta',
-    });
-    expect(screen.getByRole('status')).toBeInTheDocument();
-  });
-
-  it('renders nothing once the input selection is already the working model', () => {
-    const { container } = renderPill({
-      inputModel: 'model-beta',
-      lastThreadModel: 'model-alpha',
-      activePreferredModel: 'model-alpha',
-    });
-    expect(container.firstChild).toBeNull();
-  });
-
-  it('falls back to the thread model before the preference while the input has not reported', () => {
-    const { container } = renderPill({
-      inputModel: null,
-      lastThreadModel: 'model-beta',
-      activePreferredModel: 'model-alpha',
-    });
+  it('renders nothing once the composer already shows the working model', () => {
+    const { container } = renderPill({ composerModel: 'model-beta' });
     expect(container.firstChild).toBeNull();
   });
 
   it('renders nothing without a suggestion', () => {
-    const { container } = renderPill({ fallbackSuggestion: null, activePreferredModel: null });
+    const { container } = renderPill({ fallbackSuggestion: null });
     expect(container.firstChild).toBeNull();
   });
 });

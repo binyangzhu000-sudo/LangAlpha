@@ -4,8 +4,9 @@
  * by hand off the same hook, so a prop added on one side silently stopped
  * existing on the other; only the genuinely per-surface pieces stay arguments.
  */
-import { useCallback, useMemo } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useCallback, useMemo, useRef } from 'react';
+import { useNavigate } from 'react-router';
+import { useWorkspaceLabel } from '@/hooks/useWorkspaceLabel';
 import { useNavigationData } from './useNavigationData';
 import type { NavWorkspace } from './useNavigationData';
 import type { SidebarAgentRow } from '../session/subagents/subagentStatus';
@@ -26,11 +27,10 @@ export interface UseNavTreePropsOptions {
   /**
    * REQUIRED per surface: the hosts deliberately diverge (desktop opens the
    * workspace home, mobile opens a fresh default thread), so neither inherits
-   * a default that would silently drift from the other.
+   * a default that would silently drift from the other. `ws` is the tree's
+   * row for the workspace, undefined while the list does not have it.
    */
-  onNewThread: (wsId: string) => void;
-  /** False parks the whole data layer for a drawer that is mounted but never shown (desktop ChatViews). */
-  enabled?: boolean;
+  onNewThread: (wsId: string, ws: NavWorkspace | undefined) => void;
   /** Route-state name to fall back on before the tree has loaded the workspace row. */
   fallbackWorkspaceName?: string;
 }
@@ -42,8 +42,7 @@ export function useNavTreeProps({
   currentWorkspaceId,
   currentThreadId,
   agents,
-  onNewThread,
-  enabled = true,
+  onNewThread: openNewThread,
   fallbackWorkspaceName,
 }: UseNavTreePropsOptions) {
   const navigate = useNavigate();
@@ -60,26 +59,31 @@ export function useNavTreeProps({
     renameWorkspace,
     pinThread,
     archiveThread,
-  } = useNavigationData(currentWorkspaceId || '', { enabled });
+  } = useNavigationData(currentWorkspaceId || '');
 
   const findWorkspace = useCallback(
     (wsId: string): NavWorkspace | undefined => workspaces.find((ws) => ws.workspace_id === wsId),
     [workspaces],
   );
+  const label = useWorkspaceLabel();
+
+  const onNewThread = useCallback(
+    (wsId: string) => openNewThread(wsId, findWorkspace(wsId)),
+    [openNewThread, findWorkspace],
+  );
 
   // Route-state contract: the workspace name/status ride along so ChatAgent
-  // skips the workspace refetch, and flash workspaces carry their agent mode.
+  // skips the workspace refetch.
   const onNavigateThread = useCallback((wsId: string, threadId: string) => {
     const ws = findWorkspace(wsId);
     navigate(`/chat/t/${threadId}`, {
       state: {
         workspaceId: wsId,
-        workspaceName: ws?.name || fallbackWorkspaceName || '',
+        workspaceName: label(ws) || fallbackWorkspaceName || '',
         workspaceStatus: ws?.status || null,
-        ...(ws?.status === 'flash' ? { agentMode: 'flash' } : {}),
       },
     });
-  }, [findWorkspace, navigate, fallbackWorkspaceName]);
+  }, [findWorkspace, navigate, fallbackWorkspaceName, label]);
 
   // Archiving the thread being viewed must not strand ChatView on a row that
   // just left the nav: mount the adjacent thread in the tree's visible order
@@ -87,11 +91,16 @@ export function useNavTreeProps({
   // the workspace's last one. The target is computed BEFORE the await (the
   // optimistic patch removes the row) and navigation waits for the server —
   // a failed archive rolls back and must leave the user where they are.
+  // Read at call time: this handler reaches every memoized sidebar row, and
+  // an identity that followed the thread data re-rendered them all on each
+  // refetch.
+  const workspaceThreadsRef = useRef(workspaceThreads);
+  workspaceThreadsRef.current = workspaceThreads;
   const onArchiveThread = useCallback(async (wsId: string, threadId: string) => {
     const isCurrent = threadId === currentThreadId;
     let next;
     if (isCurrent) {
-      const rows = workspaceThreads[wsId]?.threads || [];
+      const rows = workspaceThreadsRef.current[wsId]?.threads || [];
       const idx = rows.findIndex((th) => th.thread_id === threadId);
       next = idx >= 0 ? rows[idx + 1] ?? rows[idx - 1] : undefined;
     }
@@ -103,12 +112,12 @@ export function useNavTreeProps({
       const ws = findWorkspace(wsId);
       navigate(`/chat/${wsId}`, {
         state: {
-          workspaceName: ws?.name || fallbackWorkspaceName || '',
+          workspaceName: label(ws) || fallbackWorkspaceName || '',
           workspaceStatus: ws?.status || null,
         },
       });
     }
-  }, [currentThreadId, workspaceThreads, onNavigateThread, findWorkspace, navigate, fallbackWorkspaceName, archiveThread]);
+  }, [currentThreadId, onNavigateThread, findWorkspace, navigate, fallbackWorkspaceName, archiveThread, label]);
 
   return useMemo(() => ({
     workspaces,

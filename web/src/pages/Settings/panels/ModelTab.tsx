@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useMutationState } from '@tanstack/react-query';
-import { Search, Pin, Settings2 } from 'lucide-react';
-import { useNavigate } from 'react-router-dom';
+import { Search, Pin } from 'lucide-react';
+import { Link } from 'react-router';
 import { Select } from '@/components/ui/select';
-import { useUser } from '@/hooks/useUser';
+import { useSearchTierAllows } from '@/hooks/useSearchTierAllows';
 import { usePreferences } from '@/hooks/usePreferences';
 import { PREFERENCE_MUTATION_KEY, useUpdatePreferences } from '@/hooks/useUpdatePreferences';
 import { ModelTierConfig } from '@/components/model/ModelTierConfig';
@@ -11,12 +11,16 @@ import { ModelSelector } from '@/components/model/ModelSelector';
 import { FallbackModelsPicker } from '@/components/model/FallbackModelsPicker';
 import { PerModelMatrix } from '@/components/model/PerModelMatrix';
 import { AccountTuningDefaults } from '@/components/model/AccountTuningDefaults';
+import { DefaultModelScopeChoice } from '@/components/model/DefaultModelScopeChoice';
+import { useDefaultModelChange } from '@/hooks/useDefaultModelChange';
 import { useAllModels } from '@/hooks/useAllModels';
-import { isPlatformMode } from '@/config/hostMode';
-import { useTranslation } from 'react-i18next';
-import { ConnectedAccounts } from './ConnectedAccounts';
-import { modelPrefs, splitPreferenceWrite } from '@/lib/modelPreferences';
-import type { PreferencePatch, PreferencesLike } from '@/lib/modelPreferences';
+import { useQuickAccessModels } from '@/hooks/useQuickAccessModels';
+import { modelLabel, modelMatches } from '@/lib/modelLabel';
+import { Trans, useTranslation } from 'react-i18next';
+import { ModelAccessSection } from './ModelAccessSection';
+import { BACKGROUND_AUTO, backgroundDefaultChoice, modelPrefs, readDefaultModelScope, splitPreferenceWrite } from '@/lib/modelPreferences';
+import { useModelSlotCopy } from '@/components/model/useModelSlotCopy';
+import type { ModelSlot, DefaultModelScope, PreferencePatch, PreferencesLike } from '@/lib/modelPreferences';
 
 type ModelTabMode = 'simple' | 'advanced';
 
@@ -43,7 +47,7 @@ function SectionHeading({ children }: { children: React.ReactNode }) {
   );
 }
 
-/** Model tab: default/flash model selection, starred models, per-model tuning,
+/** Model tab: default/Background model selection, starred models, per-model tuning,
  * account defaults, advanced model routing, search provider/depth, and
  * connected accounts.
  *
@@ -53,18 +57,30 @@ function SectionHeading({ children }: { children: React.ReactNode }) {
  * would only be a second copy that a failed write leaves disagreeing with the
  * settings a scheduled turn actually runs. */
 export function ModelTab() {
-  const navigate = useNavigate();
-  const { user: authUser } = useUser();
+  const tierAllows = useSearchTierAllows();
   const { preferences: prefsData } = usePreferences();
   const { mutate } = useUpdatePreferences();
   const { models: visibleModels, metadata: modelMetadata, modelAccessMap, systemDefaults: hookSystemDefaults, validModelNames, rawModels, isLoading: modelsLoading, compactionProfiles, searchProviders } = useAllModels();
   const { t } = useTranslation();
+  const modelSlotCopy = useModelSlotCopy();
 
   /** Write the keys a control owns, each routed to its own column. */
   const write = useCallback(
     (patch: PreferencePatch) => mutate(splitPreferenceWrite(patch)),
     [mutate],
   );
+
+  // The two defaults change through the flow the chat banner uses, which may
+  // ask about the threads on the old default before it writes. ModelTierConfig
+  // stays a plain controlled pair because Setup shares it, and a first-run
+  // pick has no threads to ask about.
+  const label = useCallback((model: string) => modelLabel(model, modelMetadata), [modelMetadata]);
+  const {
+    question: defaultQuestion,
+    draft: draftDefaults,
+    request: requestDefault,
+    clear: clearDefault,
+  } = useDefaultModelChange(label);
 
   const [mode, setMode] = useState<ModelTabMode>(readStoredMode);
   const isAdvanced = mode === 'advanced';
@@ -77,11 +93,11 @@ export function ModelTab() {
   const [modelPickerSearch, setModelPickerSearch] = useState('');
   const modelPickerRef = useRef<HTMLDivElement>(null);
 
-  // Model routing/tuning lives in model_preference; starred_models and the
-  // search prefs below stayed in other_preference.
+  // Model routing/tuning lives in model_preference; the search prefs below
+  // stayed in other_preference.
   const mPref = modelPrefs(prefsData);
   const otherPref = (prefsData as PreferencesLike | null)?.other_preference ?? {};
-  const starredModels = Array.isArray(otherPref.starred_models) ? otherPref.starred_models as string[] : [];
+  const quickAccess = useQuickAccessModels();
   // Every name the catalog still carries, access aside. A fallback the user
   // temporarily cannot reach is still configured; one the manifest dropped is
   // not, and _resolve_fallback_clients skips it without saying so, leaving the
@@ -98,7 +114,25 @@ export function ModelTab() {
   const fallbackModels = modelsLoading || catalogNames.size === 0
     ? storedFallbacks
     : storedFallbacks.filter((m) => catalogNames.has(m));
-  const setStarred = (next: string[]) => write({ starred_models: next.length > 0 ? next : null });
+
+  // While the question is open each select shows the model the answer would
+  // write, and a cancel puts both back on the saved ones.
+  const shownDefault = (slot: ModelSlot) => draftDefaults?.[slot]
+    ?? (slot === 'background' ? backgroundDefaultChoice(mPref) : mPref.preferred_model ?? '');
+  const setDefault = (slot: ModelSlot) => (model: string) => {
+    if (model === BACKGROUND_AUTO) clearDefault(slot, 'deployment');
+    else if (model) requestDefault({ [slot]: model });
+    else clearDefault(slot);
+  };
+  // What each slot runs on Auto. A deployment with no Background model runs Background
+  // on its primary one.
+  const deploymentPrimary = hookSystemDefaults?.default_model || undefined;
+  const deploymentBackground = hookSystemDefaults?.background_model || deploymentPrimary;
+  const autoModels = {
+    primary: deploymentPrimary && label(deploymentPrimary),
+    background: deploymentBackground && label(deploymentBackground),
+  };
+  const defaultModelScope = readDefaultModelScope(prefsData);
 
   // Close starred-model picker on click outside
   useEffect(() => {
@@ -112,11 +146,6 @@ export function ModelTab() {
     return () => document.removeEventListener('mousedown', handler);
   }, [showModelPicker]);
 
-  // Search provider/depth options are tier-gated per the manifest (min_tier
-  // comes pre-resolved from the API) in platform mode; OSS is ungated.
-  // Server enforces this at resolve time — the disabled state is UX only.
-  const tierAllows = (minTier: number) =>
-    !isPlatformMode || (authUser?.access_tier ?? -1) >= minTier;
   const providerOptions = Object.entries(searchProviders ?? {});
   const canCustomizeSearchProvider = providerOptions.some(([, p]) => tierAllows(p.min_tier));
   // A stored provider the catalog no longer declares reads as Default.
@@ -151,6 +180,12 @@ export function ModelTab() {
 
   return (
       <div className="space-y-6">
+        {/* Connections first: every pick below is among the models they reach. */}
+        <div className="flex flex-col gap-3">
+          <SectionHeading>{t('modelAccess.title')}</SectionHeading>
+          <ModelAccessSection />
+        </div>
+
         {/* Simple hides everything a first-time user has no reason to touch;
             Advanced adds per-model tuning, account defaults and routing. */}
         <div className="flex items-center justify-between gap-4">
@@ -181,16 +216,37 @@ export function ModelTab() {
         </div>
 
         <div>
-          {/* Default + Flash model selectors. Routing lives in its own group
+          {/* Default + Background model selectors. Routing lives in its own group
               below in Advanced, so the component's own drawer stays closed. */}
           <ModelTierConfig
             models={visibleModels}
-            primaryModel={mPref.preferred_model ?? ''}
-            onPrimaryModelChange={(v) => write({ preferred_model: v || null })}
-            flashModel={mPref.preferred_flash_model ?? ''}
-            onFlashModelChange={(v) => write({ preferred_flash_model: v || null })}
+            metadata={modelMetadata}
+            primaryModel={shownDefault('default')}
+            onPrimaryModelChange={setDefault('default')}
+            backgroundModel={shownDefault('background')}
+            onBackgroundModelChange={setDefault('background')}
             modelAccess={modelAccessMap}
+            auto={autoModels}
           />
+          {defaultQuestion && <DefaultModelScopeChoice className="mt-4" {...defaultQuestion} />}
+
+          <div className="flex flex-col gap-1.5" style={{ marginTop: '16px' }}>
+            <label htmlFor="default-model-scope" className="text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>
+              {t('settings.defaultModelChange.scopeLabel')}
+            </label>
+            <p className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
+              {t('settings.defaultModelChange.scopeDesc')}
+            </p>
+            <Select
+              id="default-model-scope"
+              value={defaultModelScope}
+              onChange={(e) => write({ default_model_scope: e.target.value as DefaultModelScope })}
+            >
+              <option value="ask">{t('settings.defaultModelChange.scopeAsk')}</option>
+              <option value="new_threads">{t('settings.defaultModelChange.newThreads')}</option>
+              <option value="existing_threads">{t('settings.defaultModelChange.scopeExistingThreads')}</option>
+            </Select>
+          </div>
 
           {/* Quick-access models — compact strip */}
           <div ref={modelPickerRef} style={{ marginTop: '16px' }}>
@@ -202,7 +258,7 @@ export function ModelTab() {
               {t('settings.starredModelsDesc')}
             </p>
             <div className="flex flex-wrap items-center gap-1.5">
-              {starredModels.filter(m => validModelNames.has(m)).map((key) => (
+              {quickAccess.models.map((key) => (
                 <span
                   key={key}
                   className="inline-flex items-center gap-1 px-2 py-1 rounded text-xs"
@@ -212,13 +268,13 @@ export function ModelTab() {
                     color: 'var(--color-text-secondary)',
                   }}
                 >
-                  {key}
+                  {modelLabel(key, modelMetadata)}
                   <button
                     type="button"
-                    onClick={() => setStarred(starredModels.filter(k => k !== key))}
+                    onClick={() => quickAccess.remove(key)}
                     className="ml-0.5 hover:opacity-70"
                     style={{ color: 'var(--color-text-tertiary)' }}
-                    aria-label={`Remove ${key}`}
+                    aria-label={t('settings.removeModel', { model: modelLabel(key, modelMetadata) })}
                   >
                     &times;
                   </button>
@@ -230,7 +286,7 @@ export function ModelTab() {
                 className="inline-flex items-center px-2 py-1 rounded text-xs font-medium"
                 style={{
                   border: '1px dashed var(--color-border-default)',
-                  color: 'var(--color-accent-primary)',
+                  color: 'var(--color-text-secondary)',
                 }}
               >
                 + {t('settings.addModels', 'Add')}
@@ -268,9 +324,7 @@ export function ModelTab() {
                 {Object.entries(visibleModels).map(([provider, providerData]) => {
                   const models: string[] = providerData?.models || [];
                   const query = modelPickerSearch.toLowerCase();
-                  const filtered = query
-                    ? models.filter(m => m.toLowerCase().includes(query))
-                    : models;
+                  const filtered = models.filter(m => modelMatches(m, query, modelMetadata));
                   if (filtered.length === 0) return null;
                   const displayName = providerData?.display_name || provider.charAt(0).toUpperCase() + provider.slice(1);
                   return (
@@ -279,24 +333,22 @@ export function ModelTab() {
                         {displayName}
                       </div>
                       {filtered.map((m) => {
-                        const isStarred = starredModels.includes(m);
+                        const isStarred = quickAccess.models.includes(m);
                         return (
                           <button
                             key={m}
                             type="button"
-                            onClick={() => setStarred(
-                              isStarred ? starredModels.filter(k => k !== m) : [...starredModels, m]
-                            )}
+                            onClick={() => (isStarred ? quickAccess.remove(m) : quickAccess.add(m))}
                             className="w-full flex items-center justify-between px-2 py-1.5 rounded-md text-xs transition-colors"
                             style={{
-                              color: isStarred ? 'var(--color-accent-light)' : 'var(--color-text-primary)',
-                              backgroundColor: isStarred ? 'var(--color-accent-soft)' : 'transparent',
+                              color: 'var(--color-text-primary)',
+                              backgroundColor: isStarred ? 'var(--color-bg-tag)' : 'transparent',
                             }}
                             onMouseEnter={(e) => { if (!isStarred) e.currentTarget.style.backgroundColor = 'var(--color-bg-elevated)'; }}
                             onMouseLeave={(e) => { if (!isStarred) e.currentTarget.style.backgroundColor = 'transparent'; }}
                           >
-                            <span>{m}</span>
-                            {isStarred && <Pin className="h-3 w-3 flex-shrink-0" style={{ color: 'var(--color-accent-primary)' }} />}
+                            <span>{modelLabel(m, modelMetadata)}</span>
+                            {isStarred && <Pin className="h-3 w-3 shrink-0" style={{ color: 'var(--color-accent-primary)' }} />}
                           </button>
                         );
                       })}
@@ -342,8 +394,9 @@ export function ModelTab() {
                   value={mPref.fetch_model ?? ''}
                   onChange={(v) => write({ fetch_model: v || null })}
                   models={visibleModels}
-                  placeholder={t('settings.modelTuning.defaultsToFlash')}
+                  placeholder={modelSlotCopy.defaultsToBackground}
                   modelAccess={modelAccessMap}
+                  metadata={modelMetadata}
                 />
                 <ModelSelector
                   label={t('settings.modelTuning.compactionModel')}
@@ -357,13 +410,30 @@ export function ModelTab() {
                     summarization_model: null,
                   })}
                   models={visibleModels}
-                  placeholder={t('settings.modelTuning.defaultsToFlash')}
+                  placeholder={modelSlotCopy.defaultsToConversation}
                   modelAccess={modelAccessMap}
+                  metadata={modelMetadata}
                 />
+                {/* A subagent's model is the subagent's own setting, kept with
+                    the rest of it rather than as a routing slot here. */}
+                <p className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
+                  <Trans
+                    i18nKey="settings.modelTuning.subagentsLink"
+                    components={{
+                      pane: (
+                        <Link
+                          to="/plugins?tab=subagents"
+                          className="underline underline-offset-2 hover:text-[var(--color-text-primary)]"
+                        />
+                      ),
+                    }}
+                  />
+                </p>
                 <FallbackModelsPicker
                   selected={fallbackModels}
                   onChange={(list) => write({ fallback_models: list })}
                   models={visibleModels}
+                  metadata={modelMetadata}
                 />
               </div>
             </div>
@@ -443,35 +513,6 @@ export function ModelTab() {
               )}
             </div>
           )}
-        </div>
-
-        {/* Providers & accounts */}
-        <div className="flex flex-col gap-3">
-          <SectionHeading>{t('settings.modelTuning.sectionProviders')}</SectionHeading>
-
-          <ConnectedAccounts />
-
-          <div
-            role="button"
-            tabIndex={0}
-            className="flex items-center justify-between gap-4 p-4 rounded-lg cursor-pointer transition-colors"
-            style={{
-              backgroundColor: 'var(--color-accent-soft)',
-              border: '1px solid var(--color-border-default)',
-            }}
-            onClick={() => navigate('/setup/method')}
-            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); navigate('/setup/method'); } }}
-          >
-            <div className="flex flex-col gap-1 min-w-0">
-              <span className="text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>
-                {t('settings.manageProviders', 'Manage providers')}
-              </span>
-              <span className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
-                Add or remove API keys, custom providers, and models
-              </span>
-            </div>
-            <Settings2 className="h-5 w-5 shrink-0" style={{ color: 'var(--color-accent-primary)' }} />
-          </div>
         </div>
 
         {saveStatus !== 'idle' && (

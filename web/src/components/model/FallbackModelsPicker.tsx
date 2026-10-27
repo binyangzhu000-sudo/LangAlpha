@@ -2,6 +2,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { useTranslation } from "react-i18next"
 import { Search, Pin } from "lucide-react"
 import type { ProviderModelsData } from "./types"
+import type { ModelMetadataEntry } from "@/hooks/useFilteredModels"
+import { modelLabel, modelMatches } from "@/lib/modelLabel"
+import { useModelSlotCopy } from "./useModelSlotCopy"
 
 // ---------------------------------------------------------------------------
 // Fallback models picker — add/remove from accessible models
@@ -12,13 +15,17 @@ export function FallbackModelsPicker({
   onChange,
   models,
   filterProviders,
+  metadata,
 }: {
   selected: string[]
   onChange: (models: string[]) => void
   models: Record<string, ProviderModelsData>
   filterProviders?: string[]
+  /** Optional model metadata: chips and rows print its display_name */
+  metadata?: Record<string, ModelMetadataEntry>
 }) {
   const { t } = useTranslation()
+  const copy = useModelSlotCopy()
   const [showAdd, setShowAdd] = useState(false)
   const [search, setSearch] = useState("")
   const containerRef = useRef<HTMLDivElement>(null)
@@ -60,9 +67,7 @@ export function FallbackModelsPicker({
     for (const [provider, pd] of Object.entries(models)) {
       if (filterProviders && !filterProviders.includes(provider)) continue
       const provModels = pd.models ?? []
-      const filtered = query
-        ? provModels.filter((m) => m.toLowerCase().includes(query))
-        : provModels
+      const filtered = provModels.filter((m) => modelMatches(m, query, metadata))
       if (filtered.length > 0) {
         groups.push({
           provider,
@@ -72,7 +77,7 @@ export function FallbackModelsPicker({
       }
     }
     return groups
-  }, [models, filterProviders, search])
+  }, [models, filterProviders, search, metadata])
 
   return (
     <div ref={containerRef} className="flex flex-col gap-1.5">
@@ -86,7 +91,7 @@ export function FallbackModelsPicker({
         className="text-xs leading-relaxed"
         style={{ color: "var(--color-text-tertiary)" }}
       >
-        {t("settings.fallbackModelsDesc")}
+        {copy.fallbackDesc}
       </p>
 
       {/* Selected chips with remove */}
@@ -101,13 +106,13 @@ export function FallbackModelsPicker({
               color: "var(--color-text-secondary)",
             }}
           >
-            {m}
+            {modelLabel(m, metadata)}
             <button
               type="button"
               onClick={() => handleRemove(m)}
               className="ml-0.5 hover:opacity-70"
               style={{ color: "var(--color-text-tertiary)" }}
-              aria-label={t("settings.removeModel", { model: m })}
+              aria-label={t("settings.removeModel", { model: modelLabel(m, metadata) })}
             >
               &times;
             </button>
@@ -192,10 +197,10 @@ export function FallbackModelsPicker({
                         if (!isSelected) e.currentTarget.style.backgroundColor = "transparent"
                       }}
                     >
-                      <span>{m}</span>
+                      <span>{modelLabel(m, metadata)}</span>
                       {isSelected && (
                         <Pin
-                          className="h-3 w-3 flex-shrink-0"
+                          className="h-3 w-3 shrink-0"
                           style={{ color: "var(--color-accent-primary)" }}
                         />
                       )}

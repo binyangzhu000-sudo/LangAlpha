@@ -10,7 +10,7 @@ Three tiers, differing in what they are for and in how you invoke them.
 {% endif %}
 | **MCP (via Python)** | Raw data as an *input to computation*: batch work, models, charts | `ExecuteCode`, or `Write` a `.py` file and run it with `Bash` |
 
-**MCP tools have no tool-call form.** They exist only as Python functions inside the sandbox, imported from `tools.<server_name>`. Every MCP call goes through Python; there is no way to invoke one directly.
+{% if direct_tool_summary %}**Most MCP tools have no tool-call form.**{% else %}**MCP tools have no tool-call form.**{% endif %} They exist only as Python functions inside the sandbox, imported from `tools.<server_name>`; there is no way to invoke one directly.{% if direct_tool_summary %} The Direct tools below are the exception: each is called as a tool, one call each, and only the ones whose line says so are also importable from `tools.<server_name>`.{% endif %}
 
 Routing:
 {% if finance_enabled %}
@@ -49,9 +49,15 @@ Call these directly for quick data retrieval. No complex post-processing — jus
 
 These servers expose raw data APIs for complex work — batch processing, modeling, calculations, and sophisticated analysis.
 
-Every server follows one convention: import from `tools.<server_name>`, and read the tool's doc under `tools/docs/<server_name>/` (one `.md` per tool — list the directory when the server's tools aren't named below) before first use. Never guess parameters. If a doc is missing, read the signature out of the generated wrapper, `tools/<server_name>.py`.
+Every server follows one convention: import from `tools.<server_name>`, and read the tool's doc under `.agents/tools/docs/<server_name>/` (one `.md` per tool, list the directory when the server's tools aren't named below) before first use. Never guess parameters. If a doc is missing, read the signature out of the generated wrapper, `.agents/tools/<server_name>.py`.
 
+A server the user has not enabled for this workspace has no wrapper to import, and calling one anyway comes back as `MCP server '<name>' is not enabled for this workspace`; that answer will not change on a retry, so use a server you do have or tell the user which one you need.
+
+{% if tool_summary %}
 {{ tool_summary }}
+{% else %}
+The servers you have are listed in the `<mcp-servers>` element of the runtime-context block that follows this prompt.
+{% endif %}
 
 When more than one server covers the same data, let their descriptions decide: pick the one whose stated scope matches your question most narrowly, and stay on it for the rest of a comparison so the numbers come from one source.
 
@@ -63,6 +69,9 @@ print(result)
 ```
 
 **When to use MCP tools**: When you need raw time-series data for calculations, multi-ticker batch analysis, financial modeling, charting with matplotlib/plotly, or any task requiring programmatic data manipulation.
+{% set direct_tools_heading = "Direct tools" %}
+{% set direct_tools_sandbox = true %}
+{% include 'components/direct_tools.md.j2' %}
 {% if guidance | default("detailed") == "detailed" %}
 
 ## Inline vs. file-based execution
@@ -78,7 +87,7 @@ Pick based on how disposable the code is:
   - The script is reusable logic (valuation model, data pipeline, openpyxl builder, scraper)
   - You'll want to `Edit` specific sections after an error rather than resubmit the whole block
 
-Pattern: `Write("work/<task_name>/dcf.py", ...)` → `Bash("python work/<task_name>/dcf.py")` → `Edit` on failure → rerun. Edit-then-rerun is cheaper than resubmitting inline code.
+Pattern: `Write("<task_name>/dcf.py", ...)` → `Bash("python <task_name>/dcf.py")` → `Edit` on failure → rerun. Edit-then-rerun is cheaper than resubmitting inline code.
 
 ## Tool Selection Principles
 

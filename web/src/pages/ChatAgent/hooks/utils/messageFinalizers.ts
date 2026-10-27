@@ -7,7 +7,7 @@
 import type { ChatMessage, AssistantMessage, NotificationSegment } from '@/types/chat';
 import type { TodoItem } from '@/types/sse';
 import { INTERRUPT_CARD_BUCKETS } from '../../session/interrupts/buckets';
-import type { MessageRecord } from '../../session/types';
+import type { ToolCallAgentIndex } from '../../session/subagents/historyStore';
 
 /** Collects the interrupt_ids of every HITL card rendered on the given messages. */
 function collectRenderedInterruptIds(messages: ChatMessage[]): Set<string> {
@@ -76,27 +76,19 @@ function appendNotificationSegmentOnce(
 
 
 /**
- * Checks if a tool result indicates an onboarding-related success.
- * Onboarding tools: update_user_data for risk_preference, watchlist_item, portfolio_holding.
- * @param {string|object} resultContent - Raw result content (JSON string or parsed object)
- * @returns {boolean}
+ * Whether a tool result changed the user's workspaces: an agent created one,
+ * or handed work to one, which may create it and starts its computer. Both
+ * answer with the workspace's id. The user's own changes refresh the cached
+ * lists in their mutation hooks; this is the agent's equivalent.
  */
-function isOnboardingRelatedToolSuccess(resultContent: unknown): boolean {
-  if (resultContent == null) return false;
-  let parsed;
-  if (typeof resultContent === 'string') {
-    try {
-      parsed = JSON.parse(resultContent);
-    } catch {
-      return false;
-    }
-  } else if (typeof resultContent === 'object') {
-    parsed = resultContent;
-  } else {
+function isWorkspaceChangingToolSuccess(resultContent: unknown): boolean {
+  if (typeof resultContent !== 'string' || !resultContent.startsWith('{')) return false;
+  try {
+    const parsed = JSON.parse(resultContent);
+    return parsed?.success === true && typeof parsed.workspace_id === 'string';
+  } catch {
     return false;
   }
-  if (!parsed || parsed.success !== true) return false;
-  return !!(parsed.risk_preference || parsed.watchlist_item || parsed.portfolio_holding);
 }
 
 
@@ -107,9 +99,9 @@ function isOnboardingRelatedToolSuccess(resultContent: unknown): boolean {
  * @param targetMessageId - If provided, only finalize the specific message; otherwise finalize all
  */
 export function finalizeTodoListProcessesInMessages(
-  messages: MessageRecord[],
+  messages: ChatMessage[],
   targetMessageId?: string
-): MessageRecord[] {
+): ChatMessage[] {
   let anyChanged = false;
   const updated = messages.map((m) => {
     if (m.role !== 'assistant') return m;
@@ -156,7 +148,7 @@ export function mapToolCallIdToAgentId(
   agentId: string,
   action: string,
   pendingToolCallIds: string[],
-  toolCallIdMap: Map<string, string>,
+  toolCallIdMap: Pick<ToolCallAgentIndex, 'has' | 'set'>,
 ): string[] {
   if (eventToolCallId) {
     toolCallIdMap.set(eventToolCallId, agentId);
@@ -180,4 +172,4 @@ export function mapToolCallIdToAgentId(
   return rest;
 }
 
-export { collectRenderedInterruptIds, buildModelFallbackSegment, appendNotificationSegmentOnce, isOnboardingRelatedToolSuccess };
+export { collectRenderedInterruptIds, buildModelFallbackSegment, appendNotificationSegmentOnce, isWorkspaceChangingToolSuccess };

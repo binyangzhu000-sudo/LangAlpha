@@ -1,6 +1,6 @@
 import type { ComponentType } from 'react';
 import type { LucideIcon } from 'lucide-react';
-import type { z } from 'zod';
+import type * as z from 'zod/mini';
 import type { DashboardDataContextValue } from './framework/DashboardDataContext';
 
 export type WidgetCategory = 'markets' | 'intel' | 'personal' | 'agent' | 'workspace';
@@ -62,11 +62,11 @@ export interface WidgetDefinition<C = unknown> {
    * the prefs-load boundary (`migrations.ts` → `sanitizeConfig`) so a stored
    * config whose shape has drifted from the current code (renamed enum,
    * removed field, type drift) is auto-corrected to safe defaults instead
-   * of crashing the widget. Per-field `.catch()` recovers individual fields;
+   * of crashing the widget. Per-field `catch` recovers individual fields;
    * a fully malformed config falls back to `defaultConfig`. Widgets without
    * a schema pass through unchanged (back-compat).
    */
-  configSchema?: z.ZodType<C>;
+  configSchema?: z.ZodMiniType<C>;
 }
 
 export interface WidgetInstance<C = unknown> {
@@ -91,12 +91,11 @@ export interface RGLItem {
 export type BreakpointKey = 'lg' | 'md';
 
 export interface DashboardPrefs {
-  version: 1;
-  mode: 'classic' | 'custom';
+  version: 2;
   widgets: WidgetInstance[];
   layouts: Partial<Record<BreakpointKey, RGLItem[]>>;
   lastBreakpoint?: BreakpointKey;
   history?: Array<{ widgets: WidgetInstance[]; layouts: Partial<Record<BreakpointKey, RGLItem[]>> }>;
 }
 
-export const DASHBOARD_PREFS_VERSION = 1 as const;
+export const DASHBOARD_PREFS_VERSION = 2 as const;

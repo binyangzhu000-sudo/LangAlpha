@@ -1,17 +1,20 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useEffectEvent, useState } from 'react';
 import {
   X, Calendar, Hash, ExternalLink, TrendingUp, TrendingDown, Minus, Tag,
   Paperclip,
 } from 'lucide-react';
-import { motion, AnimatePresence } from 'framer-motion';
-import i18n from '@/i18n';
+import { motion, AnimatePresence } from '@/lib/framer';
+import { TWEEN } from '@/lib/motion';
 import { useTranslation } from 'react-i18next';
+import { useLocale } from '@/hooks/useLocale';
 import { getNewsArticle } from '../utils/api';
+import { useBackdropDismiss } from '@/hooks/useDialogA11y';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { MobileBottomSheet } from '@/components/ui/mobile-bottom-sheet';
 import { Loader } from '@/components/ui/loader';
 import { useToast } from '@/components/ui/use-toast';
 import { ContextBus } from '@/lib/contextBus';
+import { createDateFormatter } from '@/lib/format';
 import { buildNewsWidgetSnapshot, normalizeArticle } from '../utils/newsArticleFetch';
 
 interface ArticleSource {
@@ -59,9 +62,7 @@ interface NewsFallback {
 interface NewsDetailModalProps {
   newsId: string | null;
   onClose: () => void;
-  /** Legacy (Classic dashboard): URL-only fallback for the empty state. */
-  fallbackUrl?: string | null;
-  /** Rich fallback from the clicked row — preferred. */
+  /** The clicked row, drawn while (or instead of) the article loads. */
   fallback?: NewsFallback | null;
 }
 
@@ -124,17 +125,19 @@ function sentimentStyle(sentiment: string): React.CSSProperties {
   }
 }
 
-function formatDate(dateString: string | undefined): string {
+const dateTime = createDateFormatter({
+  month: 'short',
+  day: 'numeric',
+  year: 'numeric',
+  hour: 'numeric',
+  minute: '2-digit',
+});
+
+function formatDate(dateString: string | undefined, locale: string): string {
   if (!dateString) return '';
   try {
     const d = new Date(dateString);
-    return d.toLocaleDateString(i18n.language, {
-      month: 'short',
-      day: 'numeric',
-      year: 'numeric',
-      hour: 'numeric',
-      minute: '2-digit',
-    });
+    return dateTime(d, locale);
   } catch {
     return dateString;
   }
@@ -158,7 +161,6 @@ function NewsBody({
   article,
   loading,
   fetchFailed,
-  fallbackUrl,
   expandedSentiment,
   setExpandedSentiment,
   isMobile,
@@ -167,7 +169,6 @@ function NewsBody({
   article: Article | null;
   loading: boolean;
   fetchFailed?: boolean;
-  fallbackUrl?: string | null;
   expandedSentiment: number | null;
   setExpandedSentiment: React.Dispatch<React.SetStateAction<number | null>>;
   isMobile: boolean;
@@ -175,12 +176,13 @@ function NewsBody({
   onAttach?: () => void;
 }) {
   const { t: trans } = useTranslation();
-  const safeFallbackUrl = safeHttpUrl(fallbackUrl);
+  const locale = useLocale();
+  const sentimentBackdrop = useBackdropDismiss<HTMLDivElement>(() => setExpandedSentiment(null));
   const safeArticleUrl = safeHttpUrl(article?.article_url);
   if (loading && !article) {
     return (
       <div className="flex items-center justify-center py-24">
-        <Loader size={32} className="text-[color:var(--color-accent-primary)]" />
+        <Loader size={32} className="text-(--color-accent-primary)" />
       </div>
     );
   }
@@ -191,21 +193,6 @@ function NewsBody({
         <p style={{ color: 'var(--color-text-secondary)' }}>
           {fetchFailed ? 'Article details not available' : 'Article not found'}
         </p>
-        {fetchFailed && safeFallbackUrl && (
-          <a
-            href={safeFallbackUrl}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg text-sm font-medium transition-colors"
-            style={{
-              backgroundColor: 'var(--color-btn-primary-bg)',
-              color: 'var(--color-btn-primary-text)',
-            }}
-          >
-            Open article
-            <ExternalLink size={14} />
-          </a>
-        )}
       </div>
     );
   }
@@ -308,7 +295,7 @@ function NewsBody({
           )}
           {article.published_at && (
             <span className="flex items-center gap-1.5 sm:gap-2">
-              <Calendar size={isMobile ? 12 : 14} /> {formatDate(article.published_at)}
+              <Calendar size={isMobile ? 12 : 14} /> {formatDate(article.published_at, locale)}
             </span>
           )}
           <div className="ml-auto flex items-center gap-3">
@@ -470,15 +457,15 @@ function NewsBody({
                       initial={{ opacity: 0 }}
                       animate={{ opacity: 1 }}
                       exit={{ opacity: 0 }}
-                      onClick={() => setExpandedSentiment(null)}
-                      className="fixed inset-0 z-[60] flex items-center justify-center p-4"
+                      {...sentimentBackdrop}
+                      className="fixed inset-0 z-60 flex items-center justify-center p-4"
                       style={{ backgroundColor: 'rgba(0,0,0,0.5)', backdropFilter: 'blur(4px)' }}
                     >
                       <motion.div
                         initial={{ opacity: 0, scale: 0.95, y: 20 }}
                         animate={{ opacity: 1, scale: 1, y: 0 }}
-                        exit={{ opacity: 0, scale: 0.95, y: 20 }}
-                        onClick={(e) => e.stopPropagation()}
+                        exit={{ opacity: 0, scale: 0.95, y: 20, transition: TWEEN.exit }}
+                        transition={TWEEN.enter}
                         className="w-full max-w-lg rounded-2xl border p-6 shadow-2xl"
                         style={{
                           backgroundColor: 'var(--color-bg-elevated)',
@@ -532,7 +519,7 @@ function NewsBody({
   );
 }
 
-function NewsDetailModal({ newsId, onClose, fallbackUrl, fallback }: NewsDetailModalProps) {
+function NewsDetailModal({ newsId, onClose, fallback }: NewsDetailModalProps) {
   const { t } = useTranslation();
   const { toast } = useToast();
   const [article, setArticle] = useState<Article | null>(null);
@@ -540,11 +527,11 @@ function NewsDetailModal({ newsId, onClose, fallbackUrl, fallback }: NewsDetailM
   const [fetchFailed, setFetchFailed] = useState(false);
   const [expandedSentiment, setExpandedSentiment] = useState<number | null>(null);
   const isMobile = useIsMobile();
+  const backdrop = useBackdropDismiss<HTMLDivElement>(onClose);
 
   // Read the latest fallback at fetch time without re-running the effect when
   // the parent hands us a fresh object for the same newsId.
-  const fallbackRef = useRef(fallback);
-  fallbackRef.current = fallback;
+  const readFallback = useEffectEvent(() => fallback);
 
   const handleAttach = () => {
     if (!article || !newsId) return;
@@ -564,7 +551,7 @@ function NewsDetailModal({ newsId, onClose, fallbackUrl, fallback }: NewsDetailM
       return;
     }
     // Seed with the clicked row's known fields so the modal renders instantly.
-    const seed = fallbackToArticle(fallbackRef.current);
+    const seed = fallbackToArticle(readFallback());
     let cancelled = false;
     setArticle(seed);
     setFetchFailed(false);
@@ -577,8 +564,8 @@ function NewsDetailModal({ newsId, onClose, fallbackUrl, fallback }: NewsDetailM
       return;
     }
 
-    // Optional enrichment: rows without an inlined body (or the Classic
-    // dashboard's URL-only path) still fetch the full article by id.
+    // Optional enrichment: rows without an inlined body still fetch the full
+    // article by id.
     setLoading(true);
     getNewsArticle(newsId)
       .then((data) => {
@@ -603,18 +590,28 @@ function NewsDetailModal({ newsId, onClose, fallbackUrl, fallback }: NewsDetailM
   useEffect(() => {
     if (!newsId) return;
     const handleEsc = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
+      // The same guard the dialog hook uses. An Escape that abandons an IME
+      // candidate, or one a layer inside has already handled, is not a
+      // dismissal, and this listener is on the window so it hears both.
+      if (e.key !== 'Escape' || e.defaultPrevented || e.isComposing || e.keyCode === 229) return;
+      // Innermost layer first. With a sentiment card open, Escape was aimed at
+      // the card, and closing the article behind it would throw away what the
+      // reader was reading to dismiss something the size of a tooltip.
+      if (expandedSentiment !== null) {
+        setExpandedSentiment(null);
+        return;
+      }
+      onClose();
     };
     window.addEventListener('keydown', handleEsc);
     return () => window.removeEventListener('keydown', handleEsc);
-  }, [newsId, onClose]);
+  }, [newsId, onClose, expandedSentiment]);
 
   const body = (
     <NewsBody
       article={article}
       loading={loading}
       fetchFailed={fetchFailed}
-      fallbackUrl={fallbackUrl}
       expandedSentiment={expandedSentiment}
       setExpandedSentiment={setExpandedSentiment}
       isMobile={isMobile}
@@ -645,15 +642,15 @@ function NewsDetailModal({ newsId, onClose, fallbackUrl, fallback }: NewsDetailM
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
           exit={{ opacity: 0 }}
-          onClick={onClose}
-          className="fixed inset-0 z-50 flex items-center justify-center p-8"
+          {...backdrop}
+          className="fixed inset-0 z-1010 flex items-center justify-center p-8"
           style={{ backgroundColor: 'var(--color-bg-overlay, rgba(0,0,0,0.6))', backdropFilter: 'blur(4px)' }}
         >
           <motion.div
             initial={{ opacity: 0, scale: 0.95, y: 20 }}
             animate={{ opacity: 1, scale: 1, y: 0 }}
-            exit={{ opacity: 0, scale: 0.95, y: 20 }}
-            onClick={(e) => e.stopPropagation()}
+            exit={{ opacity: 0, scale: 0.95, y: 20, transition: TWEEN.exit }}
+            transition={TWEEN.enter}
             className="w-full max-w-5xl max-h-[90vh] rounded-3xl overflow-hidden shadow-2xl flex flex-col relative border"
             style={{
               backgroundColor: 'var(--color-bg-elevated)',

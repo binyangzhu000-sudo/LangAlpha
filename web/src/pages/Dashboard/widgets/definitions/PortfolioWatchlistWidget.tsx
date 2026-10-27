@@ -1,6 +1,8 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { AnimatePresence, motion } from 'framer-motion';
+import { useLocale } from '@/hooks/useLocale';
+import { AnimatePresence } from '@/lib/framer';
+import { SwapCell } from '@/components/ui/crossfade';
 import { Wallet } from 'lucide-react';
 import { useDashboardContext } from '../framework/DashboardDataContext';
 import { registerWidget } from '../framework/WidgetRegistry';
@@ -14,10 +16,11 @@ import { PortfolioWatchlistConfigSchema } from '../framework/configSchemas';
 import { RowAttachButton } from '../../components/RowAttachButton';
 import type { WidgetRenderProps } from '../types';
 import type { PortfolioRow } from '../../hooks/usePortfolioData';
-import type { WatchlistRow } from '../../hooks/useWatchlistData';
+import { watchlistQuoteRow } from '../../hooks/useWatchlistData';
 import {
   HoldingsAddButton,
   HoldingsSkeleton,
+  useHoldingsSkeletonRows,
   PortfolioNavSummary,
   PortfolioRowItem,
   WatchlistRowItem,
@@ -31,16 +34,6 @@ type PortfolioWatchlistConfig = {
   defaultTab?: PWTabKey;
   valuesHidden?: boolean;
 };
-
-function watchlistRowToQuote(r: WatchlistRow) {
-  const hasQuote = r.quoteAvailable !== false;
-  return {
-    symbol: r.symbol,
-    price: hasQuote ? r.price : undefined,
-    change: hasQuote ? r.change : undefined,
-    changePercent: hasQuote ? r.changePercent : undefined,
-  };
-}
 
 function portfolioRowToQuote(r: PortfolioRow) {
   const hasQuote = r.quoteAvailable !== false;
@@ -59,6 +52,7 @@ function PortfolioWatchlistWidget({
   updateConfig,
 }: WidgetRenderProps<PortfolioWatchlistConfig>) {
   const { t } = useTranslation();
+  const locale = useLocale();
   const {
     portfolio,
     portfolioHandlers,
@@ -76,7 +70,7 @@ function PortfolioWatchlistWidget({
   useWidgetContextExport(instance.id, {
     full: () => {
       if (activeTab === 'watchlist') {
-        const rows = watchlist.rows.map(watchlistRowToQuote);
+        const rows = watchlist.rows.map(watchlistQuoteRow);
         const body = serializeQuoteRowsToMarkdown(rows);
         const text = wrapWidgetContext(
           'personal.portfolioWatchlist',
@@ -95,7 +89,7 @@ function PortfolioWatchlistWidget({
       }
       const rows = portfolio.rows.map(portfolioRowToQuote);
       const summary = portfolioSummary(portfolio.rows);
-      const navLine = formatPortfolioNavMarkdownLine(summary);
+      const navLine = formatPortfolioNavMarkdownLine(summary, locale);
       const lines: string[] = [];
       if (navLine) lines.push(navLine, '');
       lines.push(serializeQuoteRowsToMarkdown(rows));
@@ -118,7 +112,7 @@ function PortfolioWatchlistWidget({
       if (activeTab === 'watchlist') {
         const row = watchlist.rows.find((r) => (r.watchlist_item_id ?? r.symbol) === rowId);
         if (!row) return null;
-        const quote = watchlistRowToQuote(row);
+        const quote = watchlistQuoteRow(row);
         const body = serializeQuoteRowToMarkdown(quote);
         const text = wrapWidgetContext(
           'personal.portfolioWatchlist/row',
@@ -164,7 +158,11 @@ function PortfolioWatchlistWidget({
     },
   });
 
+  // The tabs dissolve in one cell at the same scroll offset, so a tab opens at
+  // its top rather than out of view below a short list.
+  const contentRef = useRef<HTMLDivElement>(null);
   const switchTab = (tab: PWTabKey) => {
+    if (tab !== activeTab) contentRef.current?.scrollTo({ top: 0 });
     setActiveTab(tab);
     updateConfig({ defaultTab: tab });
   };
@@ -177,6 +175,9 @@ function PortfolioWatchlistWidget({
 
   const showWatchlistSkeleton = watchlist.loading && watchlist.rows.length === 0;
   const showPortfolioSkeleton = portfolio.loading && portfolio.rows.length === 0;
+  const showSkeleton = activeTab === 'watchlist' ? showWatchlistSkeleton : showPortfolioSkeleton;
+  const watchlistSkeletonRows = useHoldingsSkeletonRows('watchlist', watchlist.loaded ? watchlist.rows.length : null);
+  const portfolioSkeletonRows = useHoldingsSkeletonRows('portfolio', portfolio.loaded ? portfolio.rows.length : null);
   const hasRealHoldings = portfolio.hasRealHoldings;
 
   const activeCount =
@@ -190,7 +191,7 @@ function PortfolioWatchlistWidget({
       >
         <div className="flex items-baseline gap-2.5 min-w-0">
           <Wallet
-            className="h-3.5 w-3.5 flex-shrink-0 self-center"
+            className="h-3.5 w-3.5 shrink-0 self-center"
             style={{ color: 'var(--color-text-tertiary)' }}
           />
           <span
@@ -201,9 +202,11 @@ function PortfolioWatchlistWidget({
               ? t('dashboard.widgets.portfolioWatchlist.headerWatchlist')
               : t('dashboard.widgets.portfolioWatchlist.headerHoldings')}
           </span>
+          {/* Held but unseen while the rows load: a count of 0 that turns into
+              the real one reads as a change, not a load. */}
           <span
             className="title-font text-lg leading-none dashboard-mono"
-            style={{ color: 'var(--color-text-primary)' }}
+            style={{ color: 'var(--color-text-primary)', visibility: showSkeleton ? 'hidden' : undefined }}
           >
             {activeCount}
           </span>
@@ -253,49 +256,48 @@ function PortfolioWatchlistWidget({
         </div>
       </div>
 
-      <div className="flex-1 min-h-0 overflow-y-auto pr-1">
-        <AnimatePresence mode="wait">
+      {/* The tabs dissolve in one grid cell, so a switch never passes through
+          an empty widget. A tab the reader picks rises; the skeleton giving way
+          to its rows crossfades, and rows present at first render never enter
+          one by one. */}
+      <div ref={contentRef} className="flex-1 min-h-0 overflow-y-auto pr-1">
+        <SwapCell
+          as="div"
+          className="items-start"
+          riseKey={activeTab}
+          swapKey={`${activeTab}:${showSkeleton ? 'loading' : 'ready'}`}
+          layerClassName="flex flex-col gap-1"
+        >
           {activeTab === 'watchlist' ? (
-            <motion.div
-              key="watchlist"
-              initial={{ opacity: 0, y: 10 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -10 }}
-              className="flex flex-col gap-1"
-            >
+            <>
               {showWatchlistSkeleton ? (
-                <HoldingsSkeleton count={5} />
+                <HoldingsSkeleton count={watchlistSkeletonRows} />
               ) : (
-                watchlist.rows.map((row, i) => (
-                  <div
-                    key={row.watchlist_item_id ?? row.symbol}
-                    className="row-attach-host relative"
-                  >
-                    <WatchlistRowItem
-                      item={row}
-                      index={i}
-                      marketStatus={dashboard.marketStatus}
-                      onDelete={watchlistHandlers.onDelete}
-                    />
-                    <span className="absolute right-1 top-1/2 -translate-y-1/2">
-                      <RowAttachButton
-                        instanceId={instance.id}
-                        rowId={String(row.watchlist_item_id ?? row.symbol)}
+                <AnimatePresence initial={false}>
+                  {watchlist.rows.map((row) => (
+                    <div
+                      key={row.watchlist_item_id ?? row.symbol}
+                      className="row-attach-host relative"
+                    >
+                      <WatchlistRowItem
+                        item={row}
+                        marketStatus={dashboard.marketStatus}
+                        onDelete={watchlistHandlers.onDelete}
                       />
-                    </span>
-                  </div>
-                ))
+                      <span className="absolute right-1 top-1/2 -translate-y-1/2">
+                        <RowAttachButton
+                          instanceId={instance.id}
+                          rowId={String(row.watchlist_item_id ?? row.symbol)}
+                        />
+                      </span>
+                    </div>
+                  ))}
+                </AnimatePresence>
               )}
               <HoldingsAddButton label={t('dashboard.widgets.portfolioWatchlist.addSymbol')} onClick={watchlistHandlers.onAdd} />
-            </motion.div>
+            </>
           ) : (
-            <motion.div
-              key="portfolio"
-              initial={{ opacity: 0, y: 10 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -10 }}
-              className="flex flex-col gap-1"
-            >
+            <>
               {hasRealHoldings && (
                 <PortfolioNavSummary
                   rows={portfolio.rows}
@@ -305,35 +307,36 @@ function PortfolioWatchlistWidget({
               )}
 
               {showPortfolioSkeleton ? (
-                <HoldingsSkeleton count={3} />
+                <HoldingsSkeleton count={portfolioSkeletonRows} />
               ) : (
-                portfolio.rows.map((row, i) => (
-                  <div
-                    key={row.user_portfolio_id ?? row.symbol}
-                    className="row-attach-host relative"
-                  >
-                    <PortfolioRowItem
-                      item={row}
-                      index={i}
-                      marketStatus={dashboard.marketStatus}
-                      valuesHidden={valuesHidden}
-                      onEdit={portfolioHandlers.onEdit}
-                      onDelete={portfolioHandlers.onDelete}
-                    />
-                    <span className="absolute right-1 top-1/2 -translate-y-1/2">
-                      <RowAttachButton
-                        instanceId={instance.id}
-                        rowId={String(row.user_portfolio_id ?? row.symbol)}
+                <AnimatePresence initial={false}>
+                  {portfolio.rows.map((row) => (
+                    <div
+                      key={row.user_portfolio_id ?? row.symbol}
+                      className="row-attach-host relative"
+                    >
+                      <PortfolioRowItem
+                        item={row}
+                        marketStatus={dashboard.marketStatus}
+                        valuesHidden={valuesHidden}
+                        onEdit={portfolioHandlers.onEdit}
+                        onDelete={portfolioHandlers.onDelete}
                       />
-                    </span>
-                  </div>
-                ))
+                      <span className="absolute right-1 top-1/2 -translate-y-1/2">
+                        <RowAttachButton
+                          instanceId={instance.id}
+                          rowId={String(row.user_portfolio_id ?? row.symbol)}
+                        />
+                      </span>
+                    </div>
+                  ))}
+                </AnimatePresence>
               )}
 
               <HoldingsAddButton label={t('dashboard.widgets.portfolioWatchlist.addTransaction')} onClick={portfolioHandlers.onAdd} />
-            </motion.div>
+            </>
           )}
-        </AnimatePresence>
+        </SwapCell>
       </div>
     </div>
   );

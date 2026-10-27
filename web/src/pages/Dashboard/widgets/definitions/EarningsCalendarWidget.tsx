@@ -1,8 +1,12 @@
 import { useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
-import i18n from '@/i18n';
 import { useQuery } from '@tanstack/react-query';
+import { useLocale } from '@/hooks/useLocale';
+import { useNow } from '@/hooks/useNow';
+import { shortMonthDay, shortWeekday } from '@/lib/format';
+import { localDateStr } from '@/lib/utils';
 import { CalendarDays } from 'lucide-react';
+import { SwapCell } from '@/components/ui/crossfade';
 import { getEarningsCalendar } from '../../utils/api';
 import { registerWidget } from '../framework/WidgetRegistry';
 import { useWidgetContextExport } from '../framework/contextSnapshot';
@@ -10,13 +14,6 @@ import { serializeRowsToMarkdown, wrapWidgetContext } from '../framework/snapsho
 import { EarningsConfigSchema } from '../framework/configSchemas';
 import { RowAttachButton } from '../../components/RowAttachButton';
 import type { WidgetRenderProps } from '../types';
-
-/** Local-date YYYY-MM-DD. We can't use toISOString() because that emits UTC,
- * which crosses the day boundary for users in non-UTC zones — earnings fetched
- * for "today" then get filtered out by `e.date >= todayStr` or bucketed wrong. */
-function localDateStr(d: Date = new Date()): string {
-  return d.toLocaleDateString('en-CA'); // en-CA → YYYY-MM-DD in local time
-}
 
 type EarningsConfig = { window?: '1w' | '2w' | '1m'; tickers?: 'all' | 'portfolio' };
 
@@ -47,9 +44,9 @@ function toDate(dateStr: string): Date {
   return new Date(dateStr + 'T00:00:00');
 }
 
-function bucketFor(dateStr: string): BucketKey {
-  const now = new Date();
-  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+function bucketFor(dateStr: string, now: number): BucketKey {
+  const today = new Date(now);
+  const startOfToday = new Date(today.getFullYear(), today.getMonth(), today.getDate()).getTime();
   const d = toDate(dateStr).getTime();
   const dayMs = 86_400_000;
   if (d >= startOfToday && d < startOfToday + dayMs) return 'today';
@@ -59,14 +56,14 @@ function bucketFor(dateStr: string): BucketKey {
   return 'later';
 }
 
-function formatDateRight(dateStr: string, bucket: BucketKey): string {
+
+function formatDateRight(dateStr: string, bucket: BucketKey, locale: string): string {
   const d = toDate(dateStr);
   if (bucket === 'today') return 'Today';
   if (bucket === 'tomorrow') return 'Tomorrow';
-  if (bucket === 'week') {
-    return d.toLocaleDateString(i18n.language, { weekday: 'short' });
-  }
-  return d.toLocaleDateString(i18n.language, { month: 'short', day: 'numeric' });
+  if (Number.isNaN(d.getTime())) return '';
+  if (bucket === 'week') return shortWeekday(d, locale);
+  return shortMonthDay(d, locale);
 }
 
 function serializeEarningsToMarkdown(items: EarningsEntry[]): string {
@@ -88,10 +85,11 @@ function EarningsRow({
   instanceId: string;
 }) {
   const { t } = useTranslation();
+  const locale = useLocale();
   // formatDateRight returns 'Today'/'Tomorrow' fallthrough or the locale's
   // weekday/short-month string. Translate the today/tomorrow shortcuts so
   // they swap with locale; the others come from native Intl.DateTimeFormat.
-  const raw = formatDateRight(item.date, bucket);
+  const raw = formatDateRight(item.date, bucket, locale);
   const label = raw === 'Today'
     ? t('dashboard.widgets.earningsCalendar.bucket_today')
     : raw === 'Tomorrow'
@@ -108,7 +106,7 @@ function EarningsRow({
       }}
     >
       <div
-        className="w-8 h-8 rounded-md flex items-center justify-center overflow-hidden border flex-shrink-0"
+        className="w-8 h-8 rounded-md flex items-center justify-center overflow-hidden border shrink-0"
         style={{
           backgroundColor: 'var(--color-bg-subtle)',
           borderColor: 'var(--color-border-muted)',
@@ -136,7 +134,7 @@ function EarningsRow({
         </span>
       </div>
       <span
-        className="text-[0.6563rem] dashboard-mono uppercase tracking-wider tabular-nums flex-shrink-0"
+        className="text-[0.6563rem] dashboard-mono uppercase tracking-wider tabular-nums shrink-0"
         style={{ color: 'var(--color-text-tertiary)' }}
       >
         {label}
@@ -204,8 +202,11 @@ function EarningsCalendarWidget({ instance }: WidgetRenderProps<EarningsConfig>)
   // Use local dates end-to-end: the `from`/`to` we send must match the same
   // day the user's clock is on, or the >= todayStr filter below will drop
   // "today's" earnings for anyone east of UTC.
-  const todayStr = localDateStr();
-  const toStr = localDateStr(new Date(Date.now() + windowDays * 86_400_000));
+  // Both ends come from one clock reading; the query key changes only when a
+  // date string does.
+  const now = useNow();
+  const todayStr = localDateStr(now);
+  const toStr = localDateStr(now + windowDays * 86_400_000);
 
   const { data: earnings = [], isLoading: loading } = useQuery<EarningsEntry[]>({
     queryKey: ['earnings-calendar', todayStr, toStr],
@@ -235,10 +236,10 @@ function EarningsCalendarWidget({ instance }: WidgetRenderProps<EarningsConfig>)
       later: [],
     };
     for (const e of upcoming) {
-      buckets[bucketFor(e.date)].push(e);
+      buckets[bucketFor(e.date, now)].push(e);
     }
     return buckets;
-  }, [upcoming]);
+  }, [upcoming, now]);
 
   useWidgetContextExport(instance.id, {
     full: () => {
@@ -304,7 +305,7 @@ function EarningsCalendarWidget({ instance }: WidgetRenderProps<EarningsConfig>)
       >
         <div className="flex items-baseline gap-2.5 min-w-0">
           <CalendarDays
-            className="h-3.5 w-3.5 flex-shrink-0 self-center"
+            className="h-3.5 w-3.5 shrink-0 self-center"
             style={{ color: 'var(--color-text-tertiary)' }}
           />
           <span
@@ -321,7 +322,7 @@ function EarningsCalendarWidget({ instance }: WidgetRenderProps<EarningsConfig>)
           </span>
         </div>
         <span
-          className="text-[0.625rem] uppercase tracking-wider flex-shrink-0"
+          className="text-[0.625rem] uppercase tracking-wider shrink-0"
           style={{ color: 'var(--color-text-tertiary)' }}
         >
           {t('dashboard.widgets.earningsCalendar.windowLabel', { days: windowDays })}
@@ -329,51 +330,59 @@ function EarningsCalendarWidget({ instance }: WidgetRenderProps<EarningsConfig>)
       </div>
 
       <div className="flex-1 min-h-0 overflow-y-auto -mx-1 px-1">
-        {loading && upcoming.length === 0 ? (
-          <div className="space-y-1.5 py-1">
-            {Array.from({ length: 5 }).map((_, i) => (
-              <div
-                key={i}
-                className="h-10 rounded animate-pulse"
-                style={{
-                  backgroundColor: 'var(--color-bg-subtle)',
-                  opacity: 1 - i * 0.1,
-                }}
-              />
-            ))}
-          </div>
-        ) : upcoming.length === 0 ? (
-          <div className="h-full flex flex-col items-center justify-center gap-3 py-6">
-            <div
-              className="h-9 w-9 rounded-full flex items-center justify-center"
-              style={{ backgroundColor: 'var(--color-bg-subtle)' }}
-            >
-              <CalendarDays className="h-4 w-4" style={{ color: 'var(--color-text-tertiary)' }} />
+        {/* The skeleton crossfades to the list in place. The empty state
+            stands in the middle of the widget, so its layer takes the height. */}
+        <SwapCell
+          as="div"
+          className={!loading && upcoming.length === 0 ? 'h-full' : 'items-start'}
+          swapKey={loading && upcoming.length === 0 ? 'loading' : 'ready'}
+        >
+          {loading && upcoming.length === 0 ? (
+            <div className="space-y-1.5 py-1">
+              {Array.from({ length: 5 }).map((_, i) => (
+                <div
+                  key={i}
+                  className="h-10 rounded animate-pulse"
+                  style={{
+                    backgroundColor: 'var(--color-bg-subtle)',
+                    opacity: 1 - i * 0.1,
+                  }}
+                />
+              ))}
             </div>
-            <div className="text-center">
+          ) : upcoming.length === 0 ? (
+            <div className="h-full flex flex-col items-center justify-center gap-3 py-6">
               <div
-                className="dashboard-mono text-sm mb-0.5"
-                style={{ color: 'var(--color-text-primary)' }}
+                className="h-9 w-9 rounded-full flex items-center justify-center"
+                style={{ backgroundColor: 'var(--color-bg-subtle)' }}
               >
-                {t('dashboard.widgets.earningsCalendar.empty')}
+                <CalendarDays className="h-4 w-4" style={{ color: 'var(--color-text-tertiary)' }} />
               </div>
-              <div
-                className="text-[0.6875rem]"
-                style={{ color: 'var(--color-text-tertiary)' }}
-              >
-                {t('dashboard.widgets.earningsCalendar.emptyHint', { days: windowDays })}
+              <div className="text-center">
+                <div
+                  className="dashboard-mono text-sm mb-0.5"
+                  style={{ color: 'var(--color-text-primary)' }}
+                >
+                  {t('dashboard.widgets.earningsCalendar.empty')}
+                </div>
+                <div
+                  className="text-[0.6875rem]"
+                  style={{ color: 'var(--color-text-tertiary)' }}
+                >
+                  {t('dashboard.widgets.earningsCalendar.emptyHint', { days: windowDays })}
+                </div>
               </div>
             </div>
-          </div>
-        ) : (
-          <div className="flex flex-col gap-3">
-            <BucketSection label={t(BUCKET_KEY.today)} items={grouped.today} bucket="today" instanceId={instance.id} />
-            <BucketSection label={t(BUCKET_KEY.tomorrow)} items={grouped.tomorrow} bucket="tomorrow" instanceId={instance.id} />
-            <BucketSection label={t(BUCKET_KEY.week)} items={grouped.week} bucket="week" instanceId={instance.id} />
-            <BucketSection label={t(BUCKET_KEY.next)} items={grouped.next} bucket="next" instanceId={instance.id} />
-            <BucketSection label={t(BUCKET_KEY.later)} items={grouped.later} bucket="later" instanceId={instance.id} />
-          </div>
-        )}
+          ) : (
+            <div className="flex flex-col gap-3">
+              <BucketSection label={t(BUCKET_KEY.today)} items={grouped.today} bucket="today" instanceId={instance.id} />
+              <BucketSection label={t(BUCKET_KEY.tomorrow)} items={grouped.tomorrow} bucket="tomorrow" instanceId={instance.id} />
+              <BucketSection label={t(BUCKET_KEY.week)} items={grouped.week} bucket="week" instanceId={instance.id} />
+              <BucketSection label={t(BUCKET_KEY.next)} items={grouped.next} bucket="next" instanceId={instance.id} />
+              <BucketSection label={t(BUCKET_KEY.later)} items={grouped.later} bucket="later" instanceId={instance.id} />
+            </div>
+          )}
+        </SwapCell>
       </div>
 
     </div>

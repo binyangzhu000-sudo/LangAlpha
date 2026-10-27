@@ -1,7 +1,10 @@
 import { useMemo } from 'react';
-import { motion } from 'framer-motion';
+import { motion } from '@/lib/framer';
+import { SkeletonBar } from '@/components/ui/skeleton';
+import { useLastShape } from '@/lib/lastShape';
+import { TWEEN } from '@/lib/motion';
 import { useTranslation } from 'react-i18next';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate } from 'react-router';
 import {
   Plus,
   Pencil,
@@ -14,7 +17,9 @@ import {
   EyeOff,
 } from 'lucide-react';
 import { getExtendedHoursInfo } from '@/lib/marketUtils';
-import { createFormatter } from '@/lib/format';
+import { createFormatter, grouped2, integer } from '@/lib/format';
+import { useLocale } from '@/hooks/useLocale';
+import { formatMoney, quoteCurrency } from '@/lib/bars';
 import {
   ContextMenu,
   ContextMenuTrigger,
@@ -31,24 +36,26 @@ import {
 
 type MarketStatusData = Parameters<typeof getExtendedHoursInfo>[0];
 
-const fmt2 = createFormatter({ minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const fmt1 = createFormatter({ minimumFractionDigits: 1, maximumFractionDigits: 1 });
-const fmtInt = createFormatter({ maximumFractionDigits: 0 });
 
 interface WatchlistRowItemProps {
   item: WatchlistRow;
-  index: number;
   marketStatus: MarketStatusData;
   onDelete?: (id: string) => void;
 }
 
-export function WatchlistRowItem({ item, index, marketStatus, onDelete }: WatchlistRowItemProps) {
+export function WatchlistRowItem({ item, marketStatus, onDelete }: WatchlistRowItemProps) {
   const { t } = useTranslation();
+  const locale = useLocale();
   const navigate = useNavigate();
   const hasQuote = item.quoteAvailable !== false;
   const pos = hasQuote ? item.isPositive ?? true : true;
-  const pctStr = hasQuote ? (pos ? '+' : '') + fmt2(Number(item.changePercent)) + '%' : 'N/A';
+  const pctStr = hasQuote ? (pos ? '+' : '') + grouped2(Number(item.changePercent), locale) + '%' : 'N/A';
   const hasId = !!item.watchlist_item_id;
+  // A watchlist mixes venues: prefer the currency the snapshot was quoted in,
+  // with the row's own listing suffix as the fallback for older payloads. An
+  // index level prints bare.
+  const code = quoteCurrency(item.currency, item.symbol, item.assetClass);
 
   const { extPct, extType } = getExtendedHoursInfo(marketStatus, item, { shortLabels: true });
   const extColor = extType === 'pre' ? '#fbbf24' : '#3b82f6';
@@ -57,8 +64,8 @@ export function WatchlistRowItem({ item, index, marketStatus, onDelete }: Watchl
     <motion.div
       initial={{ opacity: 0, y: 8 }}
       animate={{ opacity: 1, y: 0 }}
-      transition={{ delay: Math.min(index, 8) * 0.05 }}
-      className="flex items-center justify-between p-3 rounded-xl border border-transparent transition-all cursor-pointer"
+      transition={TWEEN.quick}
+      className="flex items-center gap-2 p-3 rounded-xl border border-transparent transition-all cursor-pointer"
       onClick={() => navigate(`/market?symbol=${encodeURIComponent(item.symbol)}`)}
       onMouseEnter={(e) => {
         e.currentTarget.style.backgroundColor = 'var(--color-bg-hover)';
@@ -69,22 +76,26 @@ export function WatchlistRowItem({ item, index, marketStatus, onDelete }: Watchl
         e.currentTarget.style.borderColor = 'transparent';
       }}
     >
-      <div>
-        <div className="font-bold text-sm" style={{ color: 'var(--color-text-primary)' }}>
+      {/* The ticker is the row's identity and never truncates at a width a card
+          actually takes; the cap only catches a pathological symbol. */}
+      <div className="min-w-0 max-w-[50%] flex-none">
+        <div className="font-bold text-sm truncate" style={{ color: 'var(--color-text-primary)' }} title={item.symbol}>
           {item.symbol}
         </div>
-        <div className="text-xs" style={{ color: 'var(--color-text-secondary)' }}>
+        <div className="text-xs truncate" style={{ color: 'var(--color-text-secondary)' }}>
           {t('dashboard.widgets.holdings.stock')}
         </div>
       </div>
-      <div className="flex items-center gap-4">
-        <div className="text-right">
+      {/* A CN¥ price is wide enough that price and badge stop fitting side by
+          side in a narrow card. They wrap rather than run past its edge. */}
+      <div className="flex flex-1 min-w-0 flex-wrap items-center justify-end gap-x-2 gap-y-1">
+        <div className="text-right whitespace-nowrap">
           <div
             className="text-sm font-medium dashboard-mono"
             style={{ color: 'var(--color-text-primary)' }}
           >
             {hasQuote
-              ? fmt2(Number(extType && item.previousClose != null ? item.previousClose : item.price))
+              ? formatMoney(Number(extType && item.previousClose != null ? item.previousClose : item.price), code, locale)
               : 'N/A'}
           </div>
           <div
@@ -95,12 +106,12 @@ export function WatchlistRowItem({ item, index, marketStatus, onDelete }: Watchl
                 : 'var(--color-text-secondary)',
             }}
           >
-            {hasQuote ? (pos ? '+' : '') + fmt2(Number(item.change)) : 'N/A'}
+            {hasQuote ? formatMoney(Number(item.change), code, locale, { signed: true }) : 'N/A'}
           </div>
         </div>
-        <div className="text-right">
+        <div className="text-right shrink-0">
           <div
-            className="w-16 py-1 rounded-lg text-center text-xs font-bold"
+            className="min-w-16 px-2 py-1 rounded-lg text-center text-xs font-bold whitespace-nowrap"
             style={{
               backgroundColor: hasQuote
                 ? pos ? 'var(--color-profit-soft)' : 'var(--color-loss-soft)'
@@ -114,12 +125,12 @@ export function WatchlistRowItem({ item, index, marketStatus, onDelete }: Watchl
           </div>
           {hasQuote && extType && extPct != null && (
             <div
-              className="text-[0.625rem] mt-0.5 text-center flex items-center justify-center gap-0.5"
+              className="text-[0.625rem] mt-0.5 text-center flex items-center justify-center gap-0.5 whitespace-nowrap"
               style={{ color: extColor }}
             >
               {extType === 'pre' ? <Sunrise size={10} /> : <Sunset size={10} />}
-              {fmt2(Number(item.price))} {extPct >= 0 ? '+' : ''}
-              {fmt2(extPct)}%
+              {formatMoney(Number(item.price), code, locale)} {extPct >= 0 ? '+' : ''}
+              {grouped2(extPct, locale)}%
             </div>
           )}
         </div>
@@ -145,7 +156,6 @@ export function WatchlistRowItem({ item, index, marketStatus, onDelete }: Watchl
 
 interface PortfolioRowItemProps {
   item: PortfolioRow;
-  index: number;
   marketStatus: MarketStatusData;
   valuesHidden: boolean;
   onEdit?: (row: PortfolioRow) => void;
@@ -154,20 +164,20 @@ interface PortfolioRowItemProps {
 
 export function PortfolioRowItem({
   item,
-  index,
   marketStatus,
   valuesHidden,
   onEdit,
   onDelete,
 }: PortfolioRowItemProps) {
-  const { t, i18n } = useTranslation();
+  const { t } = useTranslation();
+  const locale = useLocale();
   const navigate = useNavigate();
   const hasQuote = item.quoteAvailable !== false;
   const pos = hasQuote ? item.isPositive ?? true : true;
   const currency = normalizePortfolioCurrency(item.currency);
   const plStr =
     hasQuote && item.unrealizedPlPercent != null
-      ? (pos ? '+' : '') + fmt2(Number(item.unrealizedPlPercent)) + '%'
+      ? (pos ? '+' : '') + grouped2(Number(item.unrealizedPlPercent), locale) + '%'
       : 'N/A';
   const hasId = !!item.user_portfolio_id;
 
@@ -175,14 +185,14 @@ export function PortfolioRowItem({
   const extColor = extType === 'pre' ? '#fbbf24' : '#3b82f6';
   const displayMarketValue =
     hasQuote && item.marketValue != null
-      ? formatPortfolioMoney(item.marketValue, currency, i18n.language)
+      ? formatPortfolioMoney(item.marketValue, currency, locale)
       : 'N/A';
   const displayPrice =
     hasQuote
       ? formatPortfolioMoney(
           Number(extType && item.previousClose != null ? item.previousClose : item.price),
           currency,
-          i18n.language,
+          locale,
         )
       : 'N/A';
 
@@ -190,8 +200,8 @@ export function PortfolioRowItem({
     <motion.div
       initial={{ opacity: 0, y: 8 }}
       animate={{ opacity: 1, y: 0 }}
-      transition={{ delay: Math.min(index, 8) * 0.05 }}
-      className="flex items-center justify-between p-3 rounded-xl border border-transparent transition-all cursor-pointer"
+      transition={TWEEN.quick}
+      className="flex items-center gap-2 p-3 rounded-xl border border-transparent transition-all cursor-pointer"
       onClick={() => navigate(`/market?symbol=${encodeURIComponent(item.symbol)}`)}
       onMouseEnter={(e) => {
         e.currentTarget.style.backgroundColor = 'var(--color-bg-hover)';
@@ -202,20 +212,20 @@ export function PortfolioRowItem({
         e.currentTarget.style.borderColor = 'transparent';
       }}
     >
-      <div>
-        <div className="font-bold text-sm" style={{ color: 'var(--color-text-primary)' }}>
+      <div className="min-w-0 max-w-[50%] flex-none">
+        <div className="font-bold text-sm truncate" style={{ color: 'var(--color-text-primary)' }} title={item.symbol}>
           {item.symbol}
         </div>
-        <div className="text-xs" style={{ color: 'var(--color-text-secondary)' }}>
+        <div className="text-xs truncate" style={{ color: 'var(--color-text-secondary)' }}>
           {valuesHidden
             ? t('dashboard.widgets.holdings.sharesHidden')
             : item.quantity != null
-              ? t('dashboard.widgets.holdings.shares', { n: fmtInt(Number(item.quantity)) })
+              ? t('dashboard.widgets.holdings.shares', { n: integer(Number(item.quantity), locale) })
               : ''}
         </div>
       </div>
-      <div className="flex items-center gap-4">
-        <div className="text-right">
+      <div className="flex flex-1 min-w-0 flex-wrap items-center justify-end gap-x-2 gap-y-1">
+        <div className="text-right whitespace-nowrap">
           <div
             className="text-sm font-medium dashboard-mono"
             style={{ color: 'var(--color-text-primary)' }}
@@ -230,9 +240,9 @@ export function PortfolioRowItem({
               : displayPrice}
           </div>
         </div>
-        <div className="text-right">
+        <div className="text-right shrink-0">
           <div
-            className="w-16 py-1 rounded-lg text-center text-xs font-bold"
+            className="min-w-16 px-2 py-1 rounded-lg text-center text-xs font-bold whitespace-nowrap"
             style={{
               backgroundColor: hasQuote
                 ? pos ? 'var(--color-profit-soft)' : 'var(--color-loss-soft)'
@@ -246,12 +256,12 @@ export function PortfolioRowItem({
           </div>
           {hasQuote && extType && extPct != null && (
             <div
-              className="text-[0.625rem] mt-0.5 text-center flex items-center justify-center gap-0.5"
+              className="text-[0.625rem] mt-0.5 text-center flex items-center justify-center gap-0.5 whitespace-nowrap"
               style={{ color: extColor }}
             >
               {extType === 'pre' ? <Sunrise size={10} /> : <Sunset size={10} />}
-              {formatPortfolioMoney(item.price, currency, i18n.language)} {extPct >= 0 ? '+' : ''}
-              {fmt2(extPct)}%
+              {formatPortfolioMoney(item.price, currency, locale)} {extPct >= 0 ? '+' : ''}
+              {grouped2(extPct, locale)}%
             </div>
           )}
         </div>
@@ -317,7 +327,8 @@ interface PortfolioNavSummaryProps {
 }
 
 export function PortfolioNavSummary({ rows, valuesHidden, onToggleHidden }: PortfolioNavSummaryProps) {
-  const { t, i18n } = useTranslation();
+  const { t } = useTranslation();
+  const locale = useLocale();
   const summaries = useMemo(() => portfolioSummary(rows), [rows]);
   const visibleSummaries = useMemo(
     () => summaries.filter((summary) => summary.totalValue !== 0),
@@ -365,7 +376,7 @@ export function PortfolioNavSummary({ rows, valuesHidden, onToggleHidden }: Port
           : visibleSummaries.length > 0
             ? visibleSummaries.map((summary) => (
                 <div key={summary.currency}>
-                  {formatPortfolioMoney(summary.totalValue, summary.currency, i18n.language)}
+                  {formatPortfolioMoney(summary.totalValue, summary.currency, locale)}
                 </div>
               ))
             : '--'}
@@ -383,7 +394,7 @@ export function PortfolioNavSummary({ rows, valuesHidden, onToggleHidden }: Port
             >
               {summary.isPlPositive ? <ArrowUpRight size={12} /> : <ArrowDownRight size={12} />}
               {summary.isPlPositive ? '+' : '-'}
-              {formatPortfolioMoney(Math.abs(summary.totalPl), summary.currency, i18n.language)} ({fmt1(Math.abs(summary.totalPlPct))}%)
+              {formatPortfolioMoney(Math.abs(summary.totalPl), summary.currency, locale)} ({fmt1(Math.abs(summary.totalPlPct), locale)}%)
             </div>
           ))}
         </div>
@@ -392,24 +403,36 @@ export function PortfolioNavSummary({ rows, valuesHidden, onToggleHidden }: Port
   );
 }
 
+const SKELETON_ROWS = { watchlist: 5, portfolio: 3 } as const;
+const MAX_SKELETON_ROWS = 10;
+
+/** How many skeleton rows a list should show: as many as it held the last
+ *  time it loaded here, so the card neither grows nor shrinks when the rows
+ *  land. `loadedCount` is null until the list has arrived, so neither a
+ *  skeleton nor a failed read is remembered as the list's size. */
+export function useHoldingsSkeletonRows(list: keyof typeof SKELETON_ROWS, loadedCount: number | null): number {
+  const last = useLastShape(`dashboard:${list}.rows`, loadedCount);
+  return Math.min(last ?? SKELETON_ROWS[list], MAX_SKELETON_ROWS);
+}
+
 interface HoldingsSkeletonProps {
   count: number;
 }
 
+/** Rows built from a loaded row's own box and text lines, so each is as tall
+ *  as the row that replaces it. */
 export function HoldingsSkeleton({ count }: HoldingsSkeletonProps) {
   return (
     <>
       {Array.from({ length: count }).map((_, i) => (
-        <div key={i} className="flex items-center gap-3 p-3 animate-pulse">
-          <div className="flex-1">
-            <div
-              className="h-4 rounded mb-1"
-              style={{ backgroundColor: 'var(--color-border-default)', width: '40%' }}
-            />
-            <div
-              className="h-3 rounded"
-              style={{ backgroundColor: 'var(--color-border-default)', width: '25%' }}
-            />
+        <div key={i} className="flex items-center gap-2 p-3 rounded-xl border border-transparent">
+          <div className="flex-1 min-w-0">
+            <div className="font-bold text-sm">
+              <SkeletonBar style={{ width: '40%' }} />
+            </div>
+            <div className="text-xs">
+              <SkeletonBar style={{ width: '25%' }} />
+            </div>
           </div>
         </div>
       ))}

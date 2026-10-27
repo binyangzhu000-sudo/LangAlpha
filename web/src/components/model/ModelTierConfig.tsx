@@ -1,10 +1,15 @@
-import { useCallback, useEffect, useMemo, useState } from "react"
-import { motion, AnimatePresence } from "framer-motion"
+import { useState } from "react"
+import { useTranslation } from "react-i18next"
+import { motion, AnimatePresence } from "@/lib/framer"
 import { ChevronRight, Lightbulb } from "lucide-react"
 import { cn } from "@/lib/utils"
+import { TWEEN } from "@/lib/motion"
+import { BACKGROUND_AUTO } from "@/lib/modelPreferences"
 import { ModelSelector } from "./ModelSelector"
+import { useModelSlotCopy } from "./useModelSlotCopy"
 import type { ProviderModelsData } from "./types"
 import type { ModelAccess } from "@/types/platform"
+import type { ModelMetadataEntry } from "@/hooks/useFilteredModels"
 
 export interface ModelTierConfigProps {
   /** Available models grouped by provider */
@@ -14,13 +19,22 @@ export interface ModelTierConfigProps {
   /** Current primary model selection */
   primaryModel: string
   onPrimaryModelChange: (model: string) => void
-  /** Current flash model selection */
-  flashModel: string
-  onFlashModelChange: (model: string) => void
+  /** Current Background model selection */
+  backgroundModel: string
+  onBackgroundModelChange: (model: string) => void
   /** Whether to show the "Two ways to research" explainer */
   showExplainer?: boolean
   /** Optional access map: model name → access type for badge display */
   modelAccess?: Record<string, ModelAccess>
+  /** Optional model metadata, for display names */
+  metadata?: Record<string, ModelMetadataEntry>
+  /** Settings, where both slots are account defaults and may stay unset: the
+   *  models Auto runs, the deployment's primary and Background, each as printed and
+   *  absent when the deployment names none. An unset primary is Auto; an unset
+   *  Background follows the primary once one is saved, with Auto (`BACKGROUND_AUTO`)
+   *  beside it, and is Auto before. Setup leaves this off: a first run fills
+   *  both. */
+  auto?: { primary?: string; background?: string }
 }
 
 // ---------------------------------------------------------------------------
@@ -32,65 +46,20 @@ export function ModelTierConfig({
   filterProviders,
   primaryModel,
   onPrimaryModelChange,
-  flashModel,
-  onFlashModelChange,
+  backgroundModel,
+  onBackgroundModelChange,
   showExplainer = false,
   modelAccess,
+  metadata,
+  auto,
 }: ModelTierConfigProps) {
+  const { t } = useTranslation()
   const [explainerOpen, setExplainerOpen] = useState(true)
-
-  // Auto-default flash model: pick the first model from the same provider as
-  // the primary model, or the first model in the list if provider doesn't match.
-  const autoDefaultFlashModel = useMemo(() => {
-    if (flashModel) return undefined // Already set, no auto-default needed
-
-    // Find which provider the primary model belongs to
-    let primaryProvider: string | null = null
-    for (const [provider, pd] of Object.entries(models)) {
-      if (filterProviders && !filterProviders.includes(provider)) continue
-      if (pd.models?.includes(primaryModel)) {
-        primaryProvider = provider
-        break
-      }
-    }
-
-    // Try same provider first
-    if (primaryProvider) {
-      const providerModels = models[primaryProvider]?.models ?? []
-      // Pick first model that isn't the primary (or just the first one)
-      const candidate =
-        providerModels.find((m) => m !== primaryModel) ?? providerModels[0]
-      if (candidate) return candidate
-    }
-
-    // Fallback: first model from any available provider
-    const entries = Object.entries(models)
-    for (const [provider, pd] of entries) {
-      if (filterProviders && !filterProviders.includes(provider)) continue
-      if (pd.models && pd.models.length > 0) return pd.models[0]
-    }
-    return undefined
-  }, [flashModel, primaryModel, models, filterProviders])
-
-  // When primary model changes, if flash is empty, suggest auto-default
-  const handlePrimaryChange = useCallback(
-    (model: string) => {
-      onPrimaryModelChange(model)
-      // If flash model is empty and we can auto-default, do so
-      if (!flashModel && autoDefaultFlashModel) {
-        // We'll let the parent decide via the auto-default mechanism
-      }
-    },
-    [onPrimaryModelChange, flashModel, autoDefaultFlashModel],
-  )
-
-  // When flash model is empty but we have an auto-default, apply it
-  // on first render or when conditions change
-  useEffect(() => {
-    if (!flashModel && autoDefaultFlashModel && primaryModel) {
-      onFlashModelChange(autoDefaultFlashModel)
-    }
-  }, [autoDefaultFlashModel, primaryModel, flashModel, onFlashModelChange])
+  const copy = useModelSlotCopy()
+  const autoLabel = (model: string | undefined) =>
+    model ? t("settings.autoModel", { model }) : undefined
+  const primaryAuto = autoLabel(auto?.primary)
+  const backgroundAuto = autoLabel(auto?.background)
 
   return (
     <div className="flex flex-col" style={{ gap: "24px" }}>
@@ -118,11 +87,11 @@ export function ModelTierConfig({
               style={{ color: "var(--color-accent-primary)" }}
             />
             <span className="text-sm font-medium flex-1">
-              Two agent modes
+              {copy.explainerTitle}
             </span>
             <ChevronRight
               className={cn(
-                "h-4 w-4 shrink-0 transition-transform duration-200",
+                "h-4 w-4 shrink-0 transition-transform duration-fold",
                 explainerOpen && "rotate-90",
               )}
               style={{ color: "var(--color-text-tertiary)" }}
@@ -135,7 +104,7 @@ export function ModelTierConfig({
                 initial={{ height: 0, opacity: 0 }}
                 animate={{ height: "auto", opacity: 1 }}
                 exit={{ height: 0, opacity: 0 }}
-                transition={{ duration: 0.2, ease: "easeInOut" }}
+                transition={TWEEN.fold}
                 className="overflow-hidden"
               >
                 <div className="px-4 pb-4 flex flex-col gap-3">
@@ -144,15 +113,13 @@ export function ModelTierConfig({
                       className="text-xs font-semibold"
                       style={{ color: "var(--color-text-primary)" }}
                     >
-                      PTC Mode (Primary)
+                      {copy.default.explainerTitle}
                     </span>
                     <span
                       className="text-xs leading-relaxed"
                       style={{ color: "var(--color-text-tertiary)" }}
                     >
-                      The full agent with a sandboxed environment for code
-                      execution, charts, and data analysis. Powered by your
-                      primary model.
+                      {copy.default.explainerBody}
                     </span>
                   </div>
                   <div className="flex flex-col gap-1">
@@ -160,14 +127,13 @@ export function ModelTierConfig({
                       className="text-xs font-semibold"
                       style={{ color: "var(--color-text-primary)" }}
                     >
-                      Flash Mode
+                      {copy.background.explainerTitle}
                     </span>
                     <span
                       className="text-xs leading-relaxed"
                       style={{ color: "var(--color-text-tertiary)" }}
                     >
-                      A lightweight agent for quick answers without a sandbox.
-                      Powered by your flash model for speed.
+                      {copy.background.explainerBody}
                     </span>
                   </div>
                 </div>
@@ -179,28 +145,35 @@ export function ModelTierConfig({
 
       {/* Primary Model selector */}
       <ModelSelector
-        label="Primary Model"
-        description="For deep research with code execution and data analysis"
+        label={copy.default.label}
+        description={copy.default.description}
         value={primaryModel}
-        onChange={handlePrimaryChange}
+        onChange={onPrimaryModelChange}
         models={models}
         filterProviders={filterProviders}
-        placeholder="Select primary model..."
-        required
+        placeholder={primaryAuto ?? copy.default.placeholder}
+        required={!primaryAuto}
         modelAccess={modelAccess}
+        metadata={metadata}
       />
 
-      {/* Flash Model selector */}
+      {/* Background model selector */}
       <ModelSelector
-        label="Flash Model"
-        description="For quick answers without a sandbox"
-        value={flashModel}
-        onChange={onFlashModelChange}
+        label={copy.background.label}
+        description={copy.background.description}
+        value={backgroundModel}
+        onChange={onBackgroundModelChange}
         models={models}
         filterProviders={filterProviders}
-        placeholder="Select flash model..."
-        required
+        placeholder={auto && primaryModel
+          ? copy.backgroundSameAsDefault
+          : (auto && backgroundAuto) || copy.background.placeholder}
+        autoOption={auto && primaryModel && backgroundAuto
+          ? { value: BACKGROUND_AUTO, label: backgroundAuto }
+          : undefined}
+        required={!auto}
         modelAccess={modelAccess}
+        metadata={metadata}
       />
 
     </div>

@@ -13,8 +13,10 @@ import { needsOauthConnect } from '@/pages/ChatAgent/components/mcp/mcpState';
 import type {
   Brokerage,
   CapabilityGroup,
+  CatalogServer,
   McpOauthStatus,
 } from '@/pages/ChatAgent/utils/api';
+import { isEffectivelyEnabled } from './utils/provenance';
 
 // Re-exported because this module is where the concept lives for every surface
 // that draws one; the wire shape is declared with the call that fetches it.
@@ -44,6 +46,73 @@ function hostOf(url: string): string | null {
   } catch {
     return null;
   }
+}
+
+/** A shipped brokerage joined to the user's row for it. */
+export interface ResolvedBroker {
+  b: Brokerage;
+  /** The user's catalog row for it, or null while this is still an offer. */
+  row: CatalogServer | null;
+  /** The shipped vendor the row's address belongs to: the broker itself while
+   *  it is an offer, null once the row points at no shipped host. */
+  vendor: Brokerage | null;
+  /** The name to show, which is the row's own once it is redirected. */
+  label: string;
+  /** The row points somewhere other than this broker, whatever its name says. */
+  redirected: boolean;
+  /** Waiting on a sign-in. An offer is too: it has no connection yet. */
+  needsSignIn: boolean;
+  /** Signed in and switched on, as the agent sees it. */
+  connected: boolean;
+  /** Signed in, then switched off: its tokens are intact, so switching it
+   *  back on is the whole connect. */
+  switchedOff: boolean;
+}
+
+/**
+ * Every shipped brokerage and where the user stands with it, keyed by name in
+ * shipped order.
+ *
+ * One answer for every surface that lists brokers. The Brokerages tab's card
+ * and its paragraph once worked this out separately and came to disagree: the
+ * paragraph asked about the shipped vendor while the card asked about the one
+ * its URL points at, so a repointed row left the page warning "desktop only"
+ * with no card on it saying anything of the kind.
+ */
+export function resolveBrokerages(
+  shipped: readonly Brokerage[],
+  catalogRows: readonly CatalogServer[],
+): ReadonlyMap<string, ResolvedBroker> {
+  const rowsByName = new Map(catalogRows.map((s) => [s.name, s]));
+  const resolved = new Map<string, ResolvedBroker>();
+  for (const b of shipped) {
+    const row = rowsByName.get(b.name) ?? null;
+    // Against every shipped vendor, not just this broker: a row is the user's
+    // to edit, and one repointed at the OTHER broker's host is that broker now.
+    // Matching only against `b` answered null for it, which quietly drops the
+    // constraints that address carries, including the one that costs the user
+    // a connection elsewhere.
+    const vendor = row ? brokerageForUrl(row.url, shipped) : b;
+    // Compared with this broker rather than tested for null, because an
+    // address moved to the other shipped broker still resolves to a vendor.
+    const redirected = !!row && vendor?.name !== b.name;
+    const signedIn = row?.oauth_status === 'connected';
+    const connected = !!row && signedIn && isEffectivelyEnabled(row);
+    resolved.set(b.name, {
+      b,
+      row,
+      vendor,
+      label: row && redirected ? row.name : b.label,
+      redirected,
+      // Only an http row can sign in: the registry ships an http address, but
+      // the row it creates is the user's to edit, transport included, and the
+      // backend refuses an OAuth connect on anything else.
+      needsSignIn: (!row || row.transport === 'http') && needsOauthConnect(row?.oauth_status),
+      connected,
+      switchedOff: !connected && !!row && signedIn && !row.enabled,
+    });
+  }
+  return resolved;
 }
 
 /** Why a connect cannot start here, or null when the click is live. */
@@ -110,6 +179,63 @@ export function defaultGrant(vendor: Brokerage | null | undefined): string[] {
   return (vendor?.capabilities ?? [])
     .filter((group) => group.tone !== 'danger')
     .map((group) => group.key);
+}
+
+function requiresOf(vendor: Brokerage | null | undefined, key: string): string[] {
+  return vendor?.capabilities?.find((group) => group.key === key)?.requires ?? [];
+}
+
+/**
+ * A selection with one group switched, carrying what the switch depends on.
+ *
+ * Turning a group on turns on what it requires, and turning a group off turns
+ * off whatever requires it, so the dialog cannot confirm a selection the server
+ * refuses. Read off each group's `requires` rather than a rule held here: which
+ * group needs which is the backend's fact.
+ */
+export function toggleGrant(
+  vendor: Brokerage | null | undefined,
+  granted: readonly string[],
+  key: string,
+): string[] {
+  const next = new Set(granted);
+  const on = !next.has(key);
+  const pending = [key];
+  while (pending.length > 0) {
+    const current = pending.pop() as string;
+    if (on) {
+      if (next.has(current)) continue;
+      next.add(current);
+      pending.push(...requiresOf(vendor, current));
+    } else if (next.delete(current)) {
+      for (const group of vendor?.capabilities ?? []) {
+        if (group.requires?.includes(current)) pending.push(group.key);
+      }
+    }
+  }
+  return [...next];
+}
+
+/**
+ * The part of a selection that can be in force: each group whose requirements
+ * are all selected as well.
+ *
+ * The backend reads a stored grant the same way, so a choice remembered from
+ * before the groups were linked opens on what the connection can actually do.
+ * It narrows and never widens: a group the user declined is not ticked for them.
+ */
+export function grantInForce(
+  vendor: Brokerage | null | undefined,
+  granted: readonly string[],
+): string[] {
+  const selected = new Set(granted);
+  const inForce = (key: string, seen: ReadonlySet<string>): boolean =>
+    selected.has(key) &&
+    !seen.has(key) &&
+    requiresOf(vendor, key).every((required) =>
+      inForce(required, new Set([...seen, key])),
+    );
+  return granted.filter((key) => inForce(key, new Set()));
 }
 
 /**

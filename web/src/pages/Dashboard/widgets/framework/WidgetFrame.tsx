@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect, useEffectEvent } from 'react';
 import { useTranslation } from 'react-i18next';
 import { GripVertical, Settings, MoreVertical, X, Copy, Paperclip } from 'lucide-react';
 import type { WidgetDefinition, WidgetInstance } from '../types';
@@ -79,14 +79,12 @@ export function WidgetFrame({
     });
   };
 
-  // Keep the latest onFitHeight in a ref so the ResizeObserver effect doesn't
-  // tear down / reconnect (and fire a synchronous report) on every parent
-  // render. Parent passes an inline arrow (new identity each render); without
-  // the ref, two fit-to-content widgets can ping-pong parent re-renders.
-  const onFitHeightRef = useRef(onFitHeight);
-  useEffect(() => {
-    onFitHeightRef.current = onFitHeight;
-  }, [onFitHeight]);
+  // Read the latest onFitHeight through an effect event so the ResizeObserver
+  // effect doesn't tear down / reconnect (and fire a synchronous report) on
+  // every parent render. Parent passes an inline arrow (new identity each
+  // render); as a dep, two fit-to-content widgets can ping-pong parent
+  // re-renders.
+  const reportFitHeight = useEffectEvent((totalPx: number) => onFitHeight?.(totalPx));
 
   useEffect(() => {
     if (!menuOpen) return;
@@ -141,7 +139,7 @@ export function WidgetFrame({
       debounceTimer = null;
       if (pending !== lastReported) {
         lastReported = pending;
-        onFitHeightRef.current?.(pending);
+        reportFitHeight(pending);
       }
     };
 
@@ -152,10 +150,28 @@ export function WidgetFrame({
       }
       lastReported = total;
       pending = total;
-      onFitHeightRef.current?.(total);
+      reportFitHeight(total);
     };
 
+    // The hold lifting need not change the content's size, so while one is
+    // up the subtree is watched for it. Only then: a fit widget that streams
+    // (the conversation) would otherwise measure on every commit.
+    let holdWatch: MutationObserver | null = null;
+
     const report = () => {
+      // A placeholder (a skeleton marked `data-fit-hold`) says nothing about
+      // the loaded content's height: the cell keeps its saved height, which is
+      // the content's from last time, rather than shrinking to the skeleton
+      // and growing back when the data lands, moving every cell below twice.
+      if (inner.querySelector('[data-fit-hold]')) {
+        if (!holdWatch) {
+          holdWatch = new MutationObserver(report);
+          holdWatch.observe(inner, { subtree: true, childList: true, attributeFilter: ['data-fit-hold'] });
+        }
+        return;
+      }
+      holdWatch?.disconnect();
+      holdWatch = null;
       const total = measure();
       if (total === lastReported) return;
       pending = total;
@@ -177,6 +193,7 @@ export function WidgetFrame({
     ro.observe(inner);
     return () => {
       ro.disconnect();
+      holdWatch?.disconnect();
       if (debounceTimer !== null) window.clearTimeout(debounceTimer);
     };
   }, [definition, editMode]);

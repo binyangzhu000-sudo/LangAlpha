@@ -1,6 +1,8 @@
 import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { AnimatePresence, motion } from 'framer-motion';
+import { useLocale } from '@/hooks/useLocale';
+import { AnimatePresence } from '@/lib/framer';
+import { SwapCell } from '@/components/ui/crossfade';
 import { Briefcase } from 'lucide-react';
 import { useDashboardContext } from '../framework/DashboardDataContext';
 import { registerWidget } from '../framework/WidgetRegistry';
@@ -17,6 +19,7 @@ import type { PortfolioRow } from '../../hooks/usePortfolioData';
 import {
   HoldingsAddButton,
   HoldingsSkeleton,
+  useHoldingsSkeletonRows,
   PortfolioNavSummary,
   PortfolioRowItem,
 } from './_holdingsPrimitives';
@@ -39,13 +42,14 @@ function rowToQuote(r: PortfolioRow) {
 
 function PortfolioWidget({ instance, updateConfig }: WidgetRenderProps<PortfolioConfig>) {
   const { t } = useTranslation();
+  const locale = useLocale();
   const { portfolio, portfolioHandlers, dashboard } = useDashboardContext();
 
   useWidgetContextExport(instance.id, {
     full: () => {
       const rows = portfolio.rows.map(rowToQuote);
       const summary = portfolioSummary(portfolio.rows);
-      const navLine = formatPortfolioNavMarkdownLine(summary);
+      const navLine = formatPortfolioNavMarkdownLine(summary, locale);
       const lines: string[] = [];
       if (navLine) lines.push(navLine, '');
       lines.push(serializeQuoteRowsToMarkdown(rows));
@@ -90,6 +94,7 @@ function PortfolioWidget({ instance, updateConfig }: WidgetRenderProps<Portfolio
   };
 
   const showSkeleton = portfolio.loading && portfolio.rows.length === 0;
+  const skeletonRows = useHoldingsSkeletonRows('portfolio', portfolio.loaded ? portfolio.rows.length : null);
   const hasRealHoldings = portfolio.hasRealHoldings;
 
   return (
@@ -100,7 +105,7 @@ function PortfolioWidget({ instance, updateConfig }: WidgetRenderProps<Portfolio
       >
         <div className="flex items-baseline gap-2.5 min-w-0">
           <Briefcase
-            className="h-3.5 w-3.5 flex-shrink-0 self-center"
+            className="h-3.5 w-3.5 shrink-0 self-center"
             style={{ color: 'var(--color-text-tertiary)' }}
           />
           <span
@@ -109,42 +114,44 @@ function PortfolioWidget({ instance, updateConfig }: WidgetRenderProps<Portfolio
           >
             {t('dashboard.widgets.portfolio.header')}
           </span>
+          {/* Held but unseen while the rows load: a count of 0 that turns into
+              the real one reads as a change, not a load. */}
           <span
             className="title-font text-lg leading-none dashboard-mono"
-            style={{ color: 'var(--color-text-primary)' }}
+            style={{ color: 'var(--color-text-primary)', visibility: showSkeleton ? 'hidden' : undefined }}
           >
             {portfolio.rows.length}
           </span>
         </div>
       </div>
       <div className="flex-1 min-h-0 overflow-y-auto pr-1">
-        <AnimatePresence mode="wait">
-          <motion.div
-            key="portfolio"
-            initial={{ opacity: 0, y: 10 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: -10 }}
-            className="flex flex-col gap-1"
-          >
-            {hasRealHoldings && (
-              <PortfolioNavSummary
-                rows={portfolio.rows}
-                valuesHidden={valuesHidden}
-                onToggleHidden={toggleHidden}
-              />
-            )}
+        {/* The skeleton crossfades to the rows in place. Rows present when the
+            list first renders just are; only one added later enters. */}
+        <SwapCell
+          as="div"
+          className="items-start"
+          swapKey={showSkeleton ? 'loading' : 'ready'}
+          layerClassName="flex flex-col gap-1"
+        >
+          {hasRealHoldings && (
+            <PortfolioNavSummary
+              rows={portfolio.rows}
+              valuesHidden={valuesHidden}
+              onToggleHidden={toggleHidden}
+            />
+          )}
 
-            {showSkeleton ? (
-              <HoldingsSkeleton count={3} />
-            ) : (
-              portfolio.rows.map((row, i) => (
+          {showSkeleton ? (
+            <HoldingsSkeleton count={skeletonRows} />
+          ) : (
+            <AnimatePresence initial={false}>
+              {portfolio.rows.map((row) => (
                 <div
                   key={row.user_portfolio_id ?? row.symbol}
                   className="row-attach-host relative"
                 >
                   <PortfolioRowItem
                     item={row}
-                    index={i}
                     marketStatus={dashboard.marketStatus}
                     valuesHidden={valuesHidden}
                     onEdit={portfolioHandlers.onEdit}
@@ -157,12 +164,12 @@ function PortfolioWidget({ instance, updateConfig }: WidgetRenderProps<Portfolio
                     />
                   </span>
                 </div>
-              ))
-            )}
+              ))}
+            </AnimatePresence>
+          )}
 
-            <HoldingsAddButton label={t('dashboard.widgets.portfolio.addTransaction')} onClick={portfolioHandlers.onAdd} />
-          </motion.div>
-        </AnimatePresence>
+          <HoldingsAddButton label={t('dashboard.widgets.portfolio.addTransaction')} onClick={portfolioHandlers.onAdd} />
+        </SwapCell>
       </div>
     </div>
   );

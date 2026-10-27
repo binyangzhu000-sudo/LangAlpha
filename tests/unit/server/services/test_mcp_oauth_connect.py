@@ -37,7 +37,6 @@ from mcp.shared.auth import (
     OAuthMetadata,
 )
 
-import src.server.app.mcp_servers as mcp_servers_mod
 from src.server.services.mcp_oauth import connect, redirects, tokens
 from src.server.services.mcp_oauth.connect import (
     STATE_TTL_SECONDS,
@@ -312,6 +311,7 @@ def phase2(monkeypatch) -> SimpleNamespace:
         discoveries=[],
         applies=[],
         consented=[],
+        refusals=[],
         # The connection each write was handed, and how the block wrapping them
         # ended -- together these are what "one transaction" means here.
         write_conns=[],
@@ -392,6 +392,15 @@ def phase2(monkeypatch) -> SimpleNamespace:
     # and raised -- which the callback used to swallow, so the whole file went
     # on passing while never once exercising the write it was swallowing.
     monkeypatch.setattr(connect, "apply_consent_to_active_grants", _apply_consent)
+
+    async def _refuse_open_orders(user_id, server_name, *, conn=None):
+        env.refusals.append((user_id, server_name))
+        env.write_conns.append(conn)
+        return []
+
+    monkeypatch.setattr(
+        connect, "refuse_attempts_on_connection_change", _refuse_open_orders
+    )
     monkeypatch.setattr(
         "src.server.services.mcp_oauth.discovery.refresh_user_tool_schemas",
         _refresh_user_tool_schemas,
@@ -399,9 +408,7 @@ def phase2(monkeypatch) -> SimpleNamespace:
     monkeypatch.setattr(
         connect, "get_running_workspace_ids_for_user", _running_workspaces
     )
-    monkeypatch.setattr(
-        mcp_servers_mod, "_schedule_proactive_apply", _schedule_proactive_apply
-    )
+    monkeypatch.setattr(connect, "schedule_proactive_apply", _schedule_proactive_apply)
     return env
 
 
@@ -788,10 +795,8 @@ class TestRegistrationReuse:
             return _registration_response(status, body)
 
         monkeypatch.setattr(connect, "pinned_send", send)
-        raised = AsyncMock(side_effect=RuntimeError(f"registration failed: {status}"))
-        monkeypatch.setattr(connect, "handle_registration_response", raised)
 
-        with pytest.raises(RuntimeError, match=str(status)):
+        with pytest.raises(McpOAuthError, match=f"HTTP {status}"):
             await connect._register_client(
                 object(),
                 user_id=USER_ID,
@@ -959,10 +964,8 @@ class TestRegistrationReuse:
             return _registration_response(400, {"error": "invalid_redirect_uri"})
 
         monkeypatch.setattr(connect, "pinned_send", send)
-        raised = AsyncMock(side_effect=RuntimeError("registration failed: 400"))
-        monkeypatch.setattr(connect, "handle_registration_response", raised)
 
-        with pytest.raises(RuntimeError, match="400"):
+        with pytest.raises(McpOAuthError, match="HTTP 400, invalid_redirect_uri"):
             await connect._register_client(
                 object(),
                 user_id=USER_ID,
@@ -973,6 +976,90 @@ class TestRegistrationReuse:
             )
 
         assert len(sent) == 1
+
+
+class TestRegistrationRefusals:
+    """A registration the AS does not grant is a refusal the route can report.
+
+    The SDK raises its own ``OAuthFlowError`` subclass, which the start route
+    does not map, so a failed registration answered a bare 500. Its message
+    also embeds the response body whole, which for an AS advertising an
+    endpoint it does not serve is an HTML error page.
+    """
+
+    HTML_404 = (
+        b"<!DOCTYPE html><html><head><title>404 Not Found</title></head>"
+        b"<body><h1>Not Found</h1><p>The requested URL was not found on this "
+        b"server.</p></body></html>"
+    )
+
+    _metadata_for = TestRegistrationReuse._metadata_for
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "status,content_type,body,expected",
+        [
+            (404, "text/html", HTML_404, "HTTP 404"),
+            # A 2xx that is no registration: the SDK's parse error quotes the
+            # body, which here holds a secret the AS issued.
+            (
+                201,
+                "application/json",
+                b'{"client_secret": "issued-secret-1"}',
+                "could not be read",
+            ),
+        ],
+        ids=["an endpoint that is not there", "an answer that does not parse"],
+    )
+    async def test_refused_with_the_status_and_never_the_body(
+        self, monkeypatch, status, content_type, body, expected
+    ):
+        monkeypatch.setattr(connect, "get_connection", AsyncMock(return_value=None))
+        answer = httpx2.Response(
+            status, headers={"content-type": content_type}, content=body
+        )
+        monkeypatch.setattr(connect, "pinned_send", AsyncMock(return_value=answer))
+
+        with pytest.raises(McpOAuthError) as refused:
+            await connect._register_client(
+                object(),
+                user_id=USER_ID,
+                server_name=SERVER_NAME,
+                as_metadata=_as_metadata(),
+                client_metadata=self._metadata_for(callback_uri()),
+                auth_base_url=ISSUER,
+            )
+
+        message = str(refused.value)
+        assert expected in message
+        assert "<" not in message
+        assert "Not Found" not in message
+        assert "issued-secret-1" not in message
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            OAuthHopBlocked("POST https://auth.demo.test/register answered a redirect"),
+            httpx2.ConnectError("connection refused"),
+        ],
+        ids=["a refused hop", "no answer"],
+    )
+    async def test_a_registration_that_never_lands_is_refused_too(
+        self, monkeypatch, failure
+    ):
+        monkeypatch.setattr(connect, "get_connection", AsyncMock(return_value=None))
+        monkeypatch.setattr(connect, "pinned_send", AsyncMock(side_effect=failure))
+
+        with pytest.raises(McpOAuthError, match="sign-in could not be set up"):
+            await connect._register_client(
+                object(),
+                user_id=USER_ID,
+                server_name=SERVER_NAME,
+                as_metadata=_as_metadata(),
+                client_metadata=self._metadata_for(callback_uri()),
+                auth_base_url=ISSUER,
+            )
 
 
 class TestRoundTrip:
@@ -1937,6 +2024,11 @@ class TestReturnToAllowlist:
             # Leading slash then backslash: browsers normalize '\' to '/', so
             # '/\evil.test' becomes protocol-relative '//evil.test' — off-app.
             "/\\evil.test",
+            # urlsplit and browsers drop tab, CR and LF, which would turn
+            # each of these protocol-relative after the check passed it.
+            "/\t/evil.test",
+            "/\n/evil.test",
+            "/\r/evil.test",
         ],
     )
     def test_off_allowlist_values_fall_back_to_the_default(self, value):
@@ -1996,6 +2088,22 @@ class TestReturnToAllowlist:
         redirect = await _callback(started, code=None, error="access_denied")
 
         assert redirect.startswith(f"{DEFAULT_RETURN_TO}?mcp_error=denied")
+
+
+class TestDiscoveryHopLog:
+    @pytest.mark.asyncio
+    async def test_a_failed_hop_is_logged_by_its_host(self, monkeypatch, caplog):
+        url = "https://mcp.example.test/mcp?api_key=sk-live-in-the-query"
+
+        async def _fails(client, method, target, **kw):
+            raise RuntimeError(f"connection reset fetching {target}")
+
+        monkeypatch.setattr(connect, "pinned_request", _fails)
+        with caplog.at_level("INFO", logger=connect.__name__):
+            assert await connect._try_hop(None, url) is None
+
+        assert "mcp.example.test" in caplog.text
+        assert "sk-live-in-the-query" not in caplog.text
 
 
 # ---------------------------------------------------------------------------
@@ -2532,6 +2640,34 @@ class TestConsentIsSettledFirst:
         assert touched == ["discover", "register"]
         assert redis.only_record()["granted_capabilities"] == ["market_data"]
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("vendor", ["moomoo", "robinhood"])
+    async def test_live_orders_without_account_access_are_refused_not_repaired(
+        self, vendor, redis, phase1, monkeypatch
+    ):
+        """Adding account would grant a read the user switched off, and dropping
+        trading would store less than they asked for, so neither happens: the
+        connect stops before the vendor and says which switch to change."""
+        from src.server.services.brokerages import brokerage_by_name
+
+        touched = self._brokerage(phase1, monkeypatch)
+        url = brokerage_by_name(vendor).url
+        phase1.catalog_row = {"name": vendor, "url": url, "transport": "http"}
+
+        with pytest.raises(
+            McpOAuthError, match="Live orders can't be granted without account and positions"
+        ):
+            await start_connect(
+                USER_ID, vendor, granted_capabilities=["market_data", "trading"]
+            )
+
+        assert touched == []
+        assert not redis.store
+        assert connect._consented_capabilities(url, ["trading", "account"]) == [
+            "account",
+            "trading",
+        ]
+
 
 class TestOlderShapedStateAtABrokerage:
     """A state record parked before the consent field existed cannot settle.
@@ -2611,19 +2747,22 @@ class TestConsentReachesTheLiveGrants:
         assert phase2.bumps == [USER_ID]
 
     @pytest.mark.asyncio
-    async def test_both_writes_ride_the_same_connection(
+    async def test_every_write_rides_the_same_connection(
         self, redis, phase1, phase2
     ):
         """Atomicity is the point, so assert the mechanism and not just that
-        both calls happened: two handles would be two transactions."""
+        the calls happened: two handles would be two transactions."""
         started = await start_connect(USER_ID, SERVER_NAME)
 
         await _callback(started, code="auth-code-1")
 
+        # The row, its grants' consent, and the refusal of the orders proposed
+        # against whatever login the row held before this exchange.
         handles = phase2.write_conns
-        assert len(handles) == 2
+        assert len(handles) == 3
         assert handles[0] is not None
-        assert handles[0] is handles[1]
+        assert all(handle is handles[0] for handle in handles)
+        assert phase2.refusals == [(USER_ID, SERVER_NAME)]
 
     @pytest.mark.asyncio
     async def test_a_failed_narrowing_takes_the_connection_row_with_it(

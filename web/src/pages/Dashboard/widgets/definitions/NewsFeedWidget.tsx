@@ -1,8 +1,11 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useEffectEvent, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { AnimatePresence, motion } from 'framer-motion';
 import { Newspaper, Clock, Search, X } from 'lucide-react';
 import { Loader } from '@/components/ui/loader';
+import { SwapCell } from '@/components/ui/crossfade';
+import { useNow } from '@/hooks/useNow';
+import { useLocale } from '@/hooks/useLocale';
+import { relativeTime } from '@/lib/format';
 import { useDashboardContext } from '../framework/DashboardDataContext';
 import { registerWidget } from '../framework/WidgetRegistry';
 import { NewsFeedConfigSchema } from '../framework/configSchemas';
@@ -13,14 +16,12 @@ import {
   type NewsArticleDetail,
 } from '../framework/snapshotSerializers';
 import { buildNewsArticleSnapshot } from '../../utils/newsArticleFetch';
-import type { NewsSentimentItem } from '../../utils/newsItem';
+import { isWithinDateRange, type NewsDateRange, type NewsSentimentItem } from '../../utils/newsItem';
 import { RowAttachButton } from '../../components/RowAttachButton';
 import type { WidgetRenderProps } from '../types';
 
 type NewsFeedSource = 'top' | 'market' | 'portfolio' | 'watchlist';
 type NewsFeedConfig = { source?: NewsFeedSource; limit?: number };
-
-type DateRangeKey = 'all' | '1h' | '6h' | '24h' | '7d';
 
 const SOURCE_KEY: Record<NewsFeedSource, string> = {
   top: 'dashboard.widgets.newsFeed.tab_top',
@@ -31,7 +32,7 @@ const SOURCE_KEY: Record<NewsFeedSource, string> = {
 
 const SOURCES: NewsFeedSource[] = ['top', 'market', 'portfolio', 'watchlist'];
 
-const DATE_RANGES: { key: DateRangeKey; labelKey: string }[] = [
+const DATE_RANGES: { key: NewsDateRange; labelKey: string }[] = [
   { key: 'all', labelKey: 'dashboard.widgets.newsFeed.range_all' },
   { key: '1h', labelKey: 'dashboard.widgets.newsFeed.range_1h' },
   { key: '6h', labelKey: 'dashboard.widgets.newsFeed.range_6h' },
@@ -43,7 +44,6 @@ interface NewsItem {
   id?: string | number;
   title: string;
   source?: string;
-  time?: string;
   publishedAt?: string | null;
   image?: string | null;
   favicon?: string | null;
@@ -56,35 +56,21 @@ interface NewsItem {
   sentiments?: NewsSentimentItem[] | null;
 }
 
-function getDateRangeCutoff(key: DateRangeKey): number {
-  if (key === 'all') return 0;
-  const now = Date.now();
-  switch (key) {
-    case '1h': return now - 3600 * 1000;
-    case '6h': return now - 6 * 3600 * 1000;
-    case '24h': return now - 24 * 3600 * 1000;
-    case '7d': return now - 7 * 86400 * 1000;
-    default: return 0;
-  }
-}
-
 function NewsRow({
   item,
-  idx,
   onClick,
 }: {
   item: NewsItem;
-  idx: number;
   onClick: () => void;
 }) {
+  const locale = useLocale();
+  const now = useNow();
+  const time = relativeTime(item.publishedAt, locale, now);
   const sentimentColor = item.isHot ? 'var(--color-profit)' : 'var(--color-text-secondary)';
   const tickers = (item.tickers?.length ?? 0) > 0 ? item.tickers! : null;
 
   return (
-    <motion.div
-      initial={{ opacity: 0, y: 8 }}
-      animate={{ opacity: 1, y: 0 }}
-      transition={{ delay: Math.min(idx, 8) * 0.03 }}
+    <div
       onClick={onClick}
       className="group flex items-start gap-3 px-2 py-2.5 rounded-md border border-transparent transition-colors cursor-pointer"
       onMouseEnter={(e) => {
@@ -95,11 +81,11 @@ function NewsRow({
       }}
     >
       {item.image ? (
-        <div className="relative h-12 w-16 flex-shrink-0 overflow-hidden rounded-md">
+        <div className="relative h-12 w-16 shrink-0 overflow-hidden rounded-md">
           <img
             src={item.image}
             alt=""
-            className="h-full w-full object-cover transition-transform duration-500 group-hover:scale-110"
+            className="h-full w-full object-cover"
             onError={(e) => {
               (e.target as HTMLImageElement).style.display = 'none';
             }}
@@ -110,14 +96,14 @@ function NewsRow({
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-1.5 mb-0.5">
           <span
-            className="w-1.5 h-1.5 rounded-full flex-shrink-0"
+            className="w-1.5 h-1.5 rounded-full shrink-0"
             style={{ backgroundColor: sentimentColor }}
           />
           {item.favicon ? (
             <img
               src={item.favicon}
               alt=""
-              className="w-3.5 h-3.5 rounded-sm flex-shrink-0"
+              className="w-3.5 h-3.5 rounded-sm shrink-0"
               onError={(e) => {
                 (e.target as HTMLImageElement).style.display = 'none';
               }}
@@ -131,12 +117,12 @@ function NewsRow({
               {item.source}
             </span>
           ) : null}
-          {item.time ? (
+          {time ? (
             <span
-              className="text-[0.625rem] flex items-center gap-0.5 flex-shrink-0"
+              className="text-[0.625rem] flex items-center gap-0.5 shrink-0"
               style={{ color: 'var(--color-text-tertiary)' }}
             >
-              <Clock size={9} /> {item.time}
+              <Clock size={9} /> {time}
             </span>
           ) : null}
         </div>
@@ -169,7 +155,7 @@ function NewsRow({
           </div>
         ) : null}
       </div>
-    </motion.div>
+    </div>
   );
 }
 
@@ -179,8 +165,9 @@ function NewsFeedWidget({ instance, updateConfig }: WidgetRenderProps<NewsFeedCo
   const initialSource: NewsFeedSource = instance.config.source ?? 'market';
   const [activeTab, setActiveTab] = useState<NewsFeedSource>(initialSource);
   const [tickerFilter, setTickerFilter] = useState('');
-  const [dateRange, setDateRange] = useState<DateRangeKey>('all');
+  const [dateRange, setDateRange] = useState<NewsDateRange>('all');
   const [sourceFilter, setSourceFilter] = useState('all');
+  const now = useNow();
 
   const sources: Record<NewsFeedSource, { items: NewsItem[]; loading: boolean }> = {
     top: { items: dashboard.curatedItems as NewsItem[], loading: dashboard.curatedLoading },
@@ -190,18 +177,33 @@ function NewsFeedWidget({ instance, updateConfig }: WidgetRenderProps<NewsFeedCo
   };
   const { items, loading } = sources[activeTab];
 
-  // Infinite scroll — only the Top feed is cursor-paginated (TickerTick). As the
-  // user nears the end (rootMargin below), prefetch the next page.
-  const hasNextPage = activeTab === 'top' && !!dashboard.curatedHasNextPage;
-  const isFetchingNextPage = activeTab === 'top' && !!dashboard.curatedIsFetchingNextPage;
-  const fetchNextPage = activeTab === 'top' ? dashboard.curatedFetchNextPage : undefined;
+  // Infinite scroll — the Top (TickerTick) and Market feeds are cursor-
+  // paginated; portfolio/watchlist are single-page. As the user nears the end
+  // (rootMargin below), prefetch the next page. The Market chain feed (non-CN
+  // users) never serves a cursor, so hasNextPage stays false there.
+  const paging =
+    activeTab === 'top'
+      ? {
+          hasNextPage: !!dashboard.curatedHasNextPage,
+          isFetchingNextPage: !!dashboard.curatedIsFetchingNextPage,
+          fetchNextPage: dashboard.curatedFetchNextPage,
+        }
+      : activeTab === 'market'
+        ? {
+            hasNextPage: !!dashboard.newsHasNextPage,
+            isFetchingNextPage: !!dashboard.newsIsFetchingNextPage,
+            fetchNextPage: dashboard.newsFetchNextPage,
+          }
+        : { hasNextPage: false, isFetchingNextPage: false, fetchNextPage: undefined };
+  const { hasNextPage, isFetchingNextPage, fetchNextPage } = paging;
 
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const sentinelRef = useRef<HTMLDivElement | null>(null);
   // Read the latest paging state inside the observer without re-creating it on
   // every page (which would re-fire on an already-visible sentinel and cascade).
-  const pageStateRef = useRef({ hasNextPage, isFetchingNextPage, fetchNextPage });
-  pageStateRef.current = { hasNextPage, isFetchingNextPage, fetchNextPage };
+  const loadNextPageIfIdle = useEffectEvent(() => {
+    if (hasNextPage && !isFetchingNextPage && fetchNextPage) fetchNextPage();
+  });
 
   useEffect(() => {
     const el = sentinelRef.current;
@@ -209,8 +211,7 @@ function NewsFeedWidget({ instance, updateConfig }: WidgetRenderProps<NewsFeedCo
     const obs = new IntersectionObserver(
       (entries) => {
         if (!entries[0]?.isIntersecting) return;
-        const s = pageStateRef.current;
-        if (s.hasNextPage && !s.isFetchingNextPage && s.fetchNextPage) s.fetchNextPage();
+        loadNextPageIfIdle();
       },
       { root: scrollRef.current, rootMargin: '500px' },
     );
@@ -225,6 +226,9 @@ function NewsFeedWidget({ instance, updateConfig }: WidgetRenderProps<NewsFeedCo
   );
 
   const switchTab = (key: NewsFeedSource) => {
+    // The feeds dissolve in one cell at the same scroll offset, so the next
+    // one opens at its top rather than out of view below a short list.
+    if (key !== activeTab) scrollRef.current?.scrollTo({ top: 0 });
     setActiveTab(key);
     setTickerFilter('');
     setDateRange('all');
@@ -244,17 +248,11 @@ function NewsFeedWidget({ instance, updateConfig }: WidgetRenderProps<NewsFeedCo
       result = result.filter((item) => item.source === sourceFilter);
     }
     if (dateRange !== 'all') {
-      const cutoff = getDateRangeCutoff(dateRange);
-      result = result.filter((item) => {
-        // Filter on the raw ISO timestamp — not the "24m ago" display string,
-        // whose unit format ("24m" vs "24 min") and wording vary by source and
-        // locale, which silently broke the Top/Market tabs' time filter.
-        const ts = item.publishedAt ? new Date(item.publishedAt).getTime() : NaN;
-        return Number.isFinite(ts) && ts >= cutoff;
-      });
+      result = result.filter((item) => isWithinDateRange(item.publishedAt, dateRange, now));
     }
     return result;
-  }, [items, tickerFilter, sourceFilter, dateRange]);
+  }, [items, tickerFilter, sourceFilter, dateRange, now]);
+  const showSkeleton = loading && filteredItems.length === 0;
 
   // Snapshot exporter: full = visible filtered list, rows = single headline.
   useWidgetContextExport(instance.id, {
@@ -262,7 +260,7 @@ function NewsFeedWidget({ instance, updateConfig }: WidgetRenderProps<NewsFeedCo
       const newsItems = filteredItems.map((it) => ({
         title: it.title,
         source: it.source,
-        publishedAt: it.time,
+        publishedAt: it.publishedAt ?? undefined,
         url: it.articleUrl ?? undefined,
         tickers: it.tickers,
       }));
@@ -294,7 +292,7 @@ function NewsFeedWidget({ instance, updateConfig }: WidgetRenderProps<NewsFeedCo
       const fallback: NewsArticleDetail = {
         title: item.title,
         source: item.source,
-        publishedAt: item.time,
+        publishedAt: item.publishedAt ?? undefined,
         url: item.articleUrl ?? undefined,
         tickers: item.tickers,
       };
@@ -315,7 +313,7 @@ function NewsFeedWidget({ instance, updateConfig }: WidgetRenderProps<NewsFeedCo
       >
         <div className="flex items-baseline gap-2.5 min-w-0">
           <Newspaper
-            className="h-3.5 w-3.5 flex-shrink-0 self-center"
+            className="h-3.5 w-3.5 shrink-0 self-center"
             style={{ color: 'var(--color-text-tertiary)' }}
           />
           <span
@@ -324,15 +322,17 @@ function NewsFeedWidget({ instance, updateConfig }: WidgetRenderProps<NewsFeedCo
           >
             {t('dashboard.widgets.newsFeed.header', { label: t(SOURCE_KEY[activeTab]) })}
           </span>
+          {/* Held but unseen while the feed loads: a count of 0 that turns into
+              the real one reads as a change, not a load. */}
           <span
             className="title-font text-lg leading-none dashboard-mono"
-            style={{ color: 'var(--color-text-primary)' }}
+            style={{ color: 'var(--color-text-primary)', visibility: showSkeleton ? 'hidden' : undefined }}
           >
             {items.length}
           </span>
         </div>
         <div
-          className="flex rounded-full p-[2px] flex-shrink-0"
+          className="flex rounded-full p-[2px] shrink-0"
           style={{ backgroundColor: 'var(--color-bg-subtle)' }}
         >
           {SOURCES.map((key) => {
@@ -358,12 +358,12 @@ function NewsFeedWidget({ instance, updateConfig }: WidgetRenderProps<NewsFeedCo
 
       <div className="flex items-center gap-2 mb-3 flex-wrap">
         <div
-          className="rings-within flex items-center gap-1.5 h-7 px-2 rounded-md border"
+          className="rings-within owns-its-edge flex items-center gap-1.5 h-7 px-2 rounded-md border"
           style={{
             backgroundColor: 'var(--color-bg-subtle)',
             borderColor: 'var(--color-border-muted)',
             width: tickerFilter ? 160 : 130,
-            transition: 'width 0.2s',
+            transition: 'width var(--motion-quick) var(--ease-out)',
           }}
         >
           <Search size={12} style={{ color: 'var(--color-text-tertiary)', flexShrink: 0 }} />
@@ -379,7 +379,7 @@ function NewsFeedWidget({ instance, updateConfig }: WidgetRenderProps<NewsFeedCo
             <button
               type="button"
               onClick={() => setTickerFilter('')}
-              className="flex-shrink-0"
+              className="shrink-0"
               style={{ color: 'var(--color-text-tertiary)' }}
               aria-label={t('dashboard.widgets.newsFeed.clearTicker')}
             >
@@ -456,100 +456,99 @@ function NewsFeedWidget({ instance, updateConfig }: WidgetRenderProps<NewsFeedCo
       </div>
 
       <div ref={scrollRef} className="flex-1 min-h-0 overflow-y-auto -mx-1 px-1">
-        <AnimatePresence mode="wait">
-          <motion.div
-            key={activeTab}
-            initial={{ opacity: 0, y: 6 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: -6 }}
-            transition={{ duration: 0.15 }}
-            className="flex flex-col gap-0.5"
-          >
-            {loading && filteredItems.length === 0 ? (
-              Array.from({ length: 5 }).map((_, i) => (
-                <div key={i} className="flex items-start gap-3 p-2 animate-pulse">
-                  <div
-                    className="h-12 w-16 flex-shrink-0 rounded-md"
-                    style={{ backgroundColor: 'var(--color-bg-subtle)' }}
-                  />
-                  <div className="flex-1">
-                    <div
-                      className="h-3 rounded mb-1.5"
-                      style={{ backgroundColor: 'var(--color-bg-subtle)', width: '35%' }}
-                    />
-                    <div
-                      className="h-3.5 rounded"
-                      style={{ backgroundColor: 'var(--color-bg-subtle)', width: `${60 + (i % 3) * 15}%` }}
-                    />
-                  </div>
-                </div>
-              ))
-            ) : filteredItems.length === 0 ? (
-              <div className="h-full flex flex-col items-center justify-center gap-2 py-8">
+        {/* The tabs dissolve in one grid cell, so a switch never passes through
+            an empty feed. A tab the reader picks rises; the skeleton giving way
+            to its rows crossfades, and rows never enter one by one. */}
+        <SwapCell
+          as="div"
+          className="items-start"
+          riseKey={activeTab}
+          swapKey={`${activeTab}:${showSkeleton ? 'loading' : 'ready'}`}
+          layerClassName="flex flex-col gap-0.5"
+        >
+          {showSkeleton ? (
+            Array.from({ length: 5 }).map((_, i) => (
+              <div key={i} className="flex items-start gap-3 p-2 animate-pulse">
                 <div
-                  className="h-9 w-9 rounded-full flex items-center justify-center"
+                  className="h-12 w-16 shrink-0 rounded-md"
                   style={{ backgroundColor: 'var(--color-bg-subtle)' }}
-                >
-                  <Newspaper className="h-4 w-4" style={{ color: 'var(--color-text-tertiary)' }} />
-                </div>
-                <div
-                  className="dashboard-mono text-sm"
-                  style={{ color: 'var(--color-text-primary)' }}
-                >
-                  {hasFilters
-                    ? t('dashboard.widgets.newsFeed.emptyFiltered')
-                    : activeTab === 'market'
-                      ? t('dashboard.widgets.newsFeed.emptyMarket')
-                      : activeTab === 'top'
-                        ? t('dashboard.widgets.newsFeed.emptyTop')
-                        : t('dashboard.widgets.newsFeed.emptyAddTo', { label: t(SOURCE_KEY[activeTab]).toLowerCase() })}
+                />
+                <div className="flex-1">
+                  <div
+                    className="h-3 rounded mb-1.5"
+                    style={{ backgroundColor: 'var(--color-bg-subtle)', width: '35%' }}
+                  />
+                  <div
+                    className="h-3.5 rounded"
+                    style={{ backgroundColor: 'var(--color-bg-subtle)', width: `${60 + (i % 3) * 15}%` }}
+                  />
                 </div>
               </div>
-            ) : (
-              filteredItems.map((item, idx) => {
-                const rowId = String(item.id ?? `${item.title}`);
-                return (
-                  <div
-                    key={item.id ?? `${idx}-${item.title}`}
-                    className="row-attach-host relative"
-                  >
-                    <NewsRow
-                      item={item}
-                      idx={idx}
-                      onClick={() => {
-                        if (item.id != null) {
-                          modals.openNews(item.id, {
-                            title: item.title,
-                            source: item.source,
-                            publishedAt: item.publishedAt ?? null,
-                            tickers: item.tickers,
-                            articleUrl: item.articleUrl ?? null,
-                            author: item.author ?? null,
-                            description: item.description ?? null,
-                            keywords: item.keywords,
-                            sentiments: item.sentiments ?? null,
-                            imageUrl: item.image ?? null,
-                            favicon: item.favicon ?? null,
-                          });
-                        }
-                      }}
-                    />
-                    <span className="absolute right-1 top-1/2 -translate-y-1/2 z-10">
-                      <RowAttachButton instanceId={instance.id} rowId={rowId} />
-                    </span>
-                  </div>
-                );
-              })
-            )}
-          </motion.div>
-        </AnimatePresence>
+            ))
+          ) : filteredItems.length === 0 ? (
+            <div className="h-full flex flex-col items-center justify-center gap-2 py-8">
+              <div
+                className="h-9 w-9 rounded-full flex items-center justify-center"
+                style={{ backgroundColor: 'var(--color-bg-subtle)' }}
+              >
+                <Newspaper className="h-4 w-4" style={{ color: 'var(--color-text-tertiary)' }} />
+              </div>
+              <div
+                className="dashboard-mono text-sm"
+                style={{ color: 'var(--color-text-primary)' }}
+              >
+                {hasFilters
+                  ? t('dashboard.widgets.newsFeed.emptyFiltered')
+                  : activeTab === 'market'
+                    ? t('dashboard.widgets.newsFeed.emptyMarket')
+                    : activeTab === 'top'
+                      ? t('dashboard.widgets.newsFeed.emptyTop')
+                      : t('dashboard.widgets.newsFeed.emptyAddTo', { label: t(SOURCE_KEY[activeTab]).toLowerCase() })}
+              </div>
+            </div>
+          ) : (
+            filteredItems.map((item, idx) => {
+              const rowId = String(item.id ?? `${item.title}`);
+              return (
+                <div
+                  key={item.id ?? `${idx}-${item.title}`}
+                  className="row-attach-host relative"
+                >
+                  <NewsRow
+                    item={item}
+                    onClick={() => {
+                      if (item.id != null) {
+                        modals.openNews(item.id, {
+                          title: item.title,
+                          source: item.source,
+                          publishedAt: item.publishedAt ?? null,
+                          tickers: item.tickers,
+                          articleUrl: item.articleUrl ?? null,
+                          author: item.author ?? null,
+                          description: item.description ?? null,
+                          keywords: item.keywords,
+                          sentiments: item.sentiments ?? null,
+                          imageUrl: item.image ?? null,
+                          favicon: item.favicon ?? null,
+                        });
+                      }
+                    }}
+                  />
+                  <span className="absolute right-1 top-1/2 -translate-y-1/2 z-10">
+                    <RowAttachButton instanceId={instance.id} rowId={rowId} />
+                  </span>
+                </div>
+              );
+            })
+          )}
+        </SwapCell>
 
-        {/* Infinite-scroll trigger (Top feed). Sits below the list so the
-            observer fires as the user nears the end and prefetches the next page. */}
+        {/* Infinite-scroll trigger (Top + Market feeds). Sits below the list so
+            the observer fires as the user nears the end and prefetches the next page. */}
         <div ref={sentinelRef} aria-hidden className="h-px w-full" />
         {isFetchingNextPage ? (
           <div className="flex justify-center py-3">
-            <Loader size={20} className="text-[color:var(--color-accent-primary)]" />
+            <Loader size={20} className="text-(--color-accent-primary)" />
           </div>
         ) : null}
       </div>

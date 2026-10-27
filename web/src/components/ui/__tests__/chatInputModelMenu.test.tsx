@@ -1,10 +1,9 @@
 /**
  * The effort/speed rows: what they show, and what a pick writes.
  *
- * The load-bearing rule is that picking the level marked "Default" clears the
- * override instead of pinning today's default as a permanent choice — that is
- * the only way back to inheriting once the word list replaced the old
- * click-the-active-icon-to-clear toggle.
+ * The load-bearing rule is that picking the level marked "Default", the one
+ * Settings gives, clears the thread's own instead of pinning today's default as
+ * a permanent choice: that is the only way back to following Settings.
  *
  * Dropdown primitives are mocked inline (same approach as McpServerRow) so
  * items are queryable without portal or pointer machinery.
@@ -12,18 +11,19 @@
 import React from 'react';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, within } from '@testing-library/react';
-import { MemoryRouter } from 'react-router-dom';
+import { MemoryRouter } from 'react-router';
 
 const h = vi.hoisted(() => ({ isMobile: false }));
 
 vi.mock('@/hooks/useIsMobile', () => ({ useIsMobile: () => h.isMobile }));
 
 vi.mock('../dropdown-menu', () => {
-  const Pass = ({ children }: { children: React.ReactNode }) => <>{children}</>;
   const Box = ({ children }: { children: React.ReactNode }) => <div>{children}</div>;
   return {
     DropdownMenu: Box,
-    DropdownMenuTrigger: Pass,
+    // The real trigger puts `disabled` on the button it wraps.
+    DropdownMenuTrigger: ({ children, disabled }: { children: React.ReactElement; disabled?: boolean }) =>
+      React.cloneElement(children as React.ReactElement<{ disabled?: boolean }>, { disabled }),
     DropdownMenuContent: Box,
     // Props pass through, so a caller's own role/aria survives — the real
     // primitive forwards them, and the effort options rely on it. data-menu-item
@@ -60,14 +60,15 @@ function renderMenu(overrides: Record<string, unknown> = {}) {
     moreModelsItems: [],
     hasStarredModels: true,
     reasoningEffort: 'high',
-    inheritedEffort: 'medium',
+    defaultEffort: 'medium',
     onReasoningEffortChange,
     fastMode: false,
     onFastModeChange,
     isCodexModel: false,
+    needsSignIn: () => false,
     reasoningEfforts: ['none', 'low', 'medium', 'high'],
     dropdownDirection: 'up' as const,
-    containerRef: { current: null },
+    container: null,
     ...overrides,
   };
   return render(
@@ -93,21 +94,19 @@ beforeEach(() => {
 });
 
 describe('effort row', () => {
-  it('shows the override as the current value, not the inherited level', () => {
+  it('shows the level it is handed as the current value', () => {
     renderMenu();
     const row = screen.getByText('Effort').closest('[role="menuitem"]')!;
     expect(within(row as HTMLElement).getByText('High')).toBeInTheDocument();
     expect(option('High')).toHaveAttribute('aria-checked', 'true');
   });
 
-  it('falls back to the inherited level when there is no override', () => {
+  it('checks nothing while the level is not known', () => {
     renderMenu({ reasoningEffort: null });
-    const row = screen.getByText('Effort').closest('[role="menuitem"]')!;
-    expect(within(row as HTMLElement).getByText('Medium')).toBeInTheDocument();
-    expect(option('Medium')).toHaveAttribute('aria-checked', 'true');
+    expect(screen.getAllByRole('menuitemradio').every((el) => el.getAttribute('aria-checked') === 'false')).toBe(true);
   });
 
-  it('badges the inherited level and nothing else', () => {
+  it('badges the Settings level and nothing else', () => {
     renderMenu();
     expect(within(option('Medium') as HTMLElement).getByText('Default')).toBeInTheDocument();
     expect(screen.getAllByText('Default')).toHaveLength(1);
@@ -156,6 +155,32 @@ describe('effort row', () => {
   });
 });
 
+describe('model names', () => {
+  it('prints the authored display name, else one derived from the key', () => {
+    renderMenu({
+      selectedModel: 'deepseek-flash',
+      threadModels: ['claude-opus-4-8'],
+      validModelNames: new Set(['deepseek-flash', 'claude-opus-4-8']),
+      metadata: { 'deepseek-flash': { display_name: 'DeepSeek-V4.1-Flash' } },
+    });
+    expect(screen.getAllByText('DeepSeek-V4.1-Flash').length).toBeGreaterThan(0);
+    expect(screen.queryByText('Deepseek Flash')).toBeNull();
+    expect(screen.getByText('Opus 4.8')).toBeInTheDocument();
+  });
+});
+
+describe('trigger', () => {
+  it('is disabled while the model list loads', () => {
+    renderMenu({ disabled: true });
+    expect(screen.getByTitle('Select model')).toBeDisabled();
+  });
+
+  it('is enabled once it has loaded', () => {
+    renderMenu();
+    expect(screen.getByTitle('Select model')).toBeEnabled();
+  });
+});
+
 describe('speed row', () => {
   it('is absent on a non-Codex model', () => {
     renderMenu();
@@ -169,6 +194,29 @@ describe('speed row', () => {
 
     fireEvent.click(option('Standard'));
     expect(onFastModeChange).toHaveBeenCalledWith(false);
+  });
+});
+
+describe('a model whose sign-in needs renewing', () => {
+  // Still pickable, since the user may reconnect at any moment, but named as
+  // needing sign-in before a send on it is refused.
+  it('says so beside its name and can still be picked', () => {
+    const onSelectModel = vi.fn();
+    renderMenu({
+      threadModels: ['gpt-x'],
+      validModelNames: new Set(['qwen3.6-flash', 'gpt-x']),
+      metadata: { 'gpt-x': { display_name: 'GPT X' }, 'qwen3.6-flash': { display_name: 'Qwen Flash' } },
+      needsSignIn: (m: string) => m === 'gpt-x',
+      onSelectModel,
+    });
+    const rowOf = (name: string) => screen.getAllByRole('menuitem').find((el) => within(el).queryByText(name))!;
+    const row = rowOf('GPT X');
+    expect(within(row).getByText('Needs sign-in')).toBeInTheDocument();
+    const other = rowOf('Qwen Flash');
+    expect(within(other).queryByText('Needs sign-in')).toBeNull();
+
+    fireEvent.click(row);
+    expect(onSelectModel).toHaveBeenCalledWith('gpt-x');
   });
 });
 

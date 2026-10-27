@@ -1,16 +1,19 @@
 import React, { useEffect, useState } from 'react';
 import { X, ExternalLink, Sparkles, ChevronDown, Paperclip } from 'lucide-react';
-import { motion, AnimatePresence } from 'framer-motion';
+import { motion, AnimatePresence } from '@/lib/framer';
+import { TWEEN } from '@/lib/motion';
 import { useTranslation } from 'react-i18next';
 import TopicBadge from './TopicBadge';
 import { getInsightDetail } from '../utils/api';
+import { useBackdropDismiss } from '@/hooks/useDialogA11y';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { MobileBottomSheet } from '@/components/ui/mobile-bottom-sheet';
 import { Loader } from '@/components/ui/loader';
 import { useToast } from '@/components/ui/use-toast';
 import { ContextBus } from '@/lib/contextBus';
+import { createDateFormatter } from '@/lib/format';
 import { buildInsightWidgetSnapshot, normalizeInsight } from '../utils/insightFetch';
-import i18n from '@/i18n';
+import { useLocale } from '@/hooks/useLocale';
 
 interface InsightTopic {
   text: string;
@@ -46,17 +49,19 @@ interface InsightDetailModalProps {
   onClose: () => void;
 }
 
-function formatDate(dateString: string | undefined): string {
+const dateTime = createDateFormatter({
+  month: 'short',
+  day: 'numeric',
+  year: 'numeric',
+  hour: 'numeric',
+  minute: '2-digit',
+});
+
+function formatDate(dateString: string | undefined, locale: string): string {
   if (!dateString) return '';
   try {
     const d = new Date(dateString);
-    return d.toLocaleDateString(i18n.language, {
-      month: 'short',
-      day: 'numeric',
-      year: 'numeric',
-      hour: 'numeric',
-      minute: '2-digit',
-    });
+    return dateTime(d, locale);
   } catch {
     return dateString;
   }
@@ -80,10 +85,11 @@ function InsightBody({
   onAttach?: () => void;
 }) {
   const { t } = useTranslation();
+  const locale = useLocale();
   if (loading) {
     return (
       <div className="flex items-center justify-center py-24">
-        <Loader size={32} className="text-[color:var(--color-accent-primary)]" />
+        <Loader size={32} className="text-(--color-accent-primary)" />
       </div>
     );
   }
@@ -124,7 +130,7 @@ function InsightBody({
           )}
           {detail.completed_at && (
             <span className="text-[0.6875rem] sm:text-xs" style={{ color: 'var(--color-text-secondary)' }}>
-              {formatDate(detail.completed_at)}
+              {formatDate(detail.completed_at, locale)}
             </span>
           )}
           {onAttach && (
@@ -263,7 +269,7 @@ function InsightBody({
                         key={i}
                         src={s.favicon}
                         alt=""
-                        className="w-4 h-4 rounded-full ring-1 ring-[var(--color-bg-elevated)]"
+                        className="w-4 h-4 rounded-full ring-1 ring-(--color-bg-elevated)"
                       />
                     ))}
                 </span>
@@ -310,6 +316,7 @@ function InsightDetailModal({ marketInsightId, onClose }: InsightDetailModalProp
   const [loading, setLoading] = useState(false);
   const [sourcesOpen, setSourcesOpen] = useState(false);
   const isMobile = useIsMobile();
+  const backdrop = useBackdropDismiss<HTMLDivElement>(onClose);
 
   const handleAttach = () => {
     if (!detail || !marketInsightId) return;
@@ -391,15 +398,15 @@ function InsightDetailModal({ marketInsightId, onClose }: InsightDetailModalProp
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
           exit={{ opacity: 0 }}
-          onClick={onClose}
-          className="fixed inset-0 z-50 flex items-center justify-center p-8"
+          {...backdrop}
+          className="fixed inset-0 z-1010 flex items-center justify-center p-8"
           style={{ backgroundColor: 'var(--color-bg-overlay, rgba(0,0,0,0.6))', backdropFilter: 'blur(4px)' }}
         >
           <motion.div
             initial={{ opacity: 0, scale: 0.95, y: 20 }}
             animate={{ opacity: 1, scale: 1, y: 0 }}
-            exit={{ opacity: 0, scale: 0.95, y: 20 }}
-            onClick={(e) => e.stopPropagation()}
+            exit={{ opacity: 0, scale: 0.95, y: 20, transition: TWEEN.exit }}
+            transition={TWEEN.enter}
             className="w-full max-w-4xl max-h-[90vh] rounded-3xl overflow-hidden shadow-2xl flex flex-col relative border"
             style={{
               backgroundColor: 'var(--color-bg-elevated)',

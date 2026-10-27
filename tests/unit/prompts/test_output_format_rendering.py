@@ -1,37 +1,32 @@
 """Tests for output_format steering in the user_profile prompt component.
 
-Renders ``components/user_profile.md.j2`` exactly as RuntimeContextMiddleware
-does and asserts the HTML-steering block appears iff ``sandbox_enabled`` (PTC,
-not Flash) and ``agent_preference.output_format == "html"``, and never
-double-renders the ``output_format`` key in the generic preference loop.
+Renders ``components/user_profile.md.j2`` and asserts the HTML-steering block
+appears iff ``main_agent_steering`` (the main agent's copy; a subagent's
+leaves it out) and ``agent_preference.output_format == "html"``, and never
+double-renders the ``output_format`` key in the generic preference loop
+unless its value is outside the vocabulary.
 """
 
 import pytest
 
-from ptc_agent.agent.prompts import get_loader, reset_loader
+from ptc_agent.agent.middleware.runtime_context.profile import render_user_profile
+from ptc_agent.agent.prompts import reset_loader
 
 HTML_BLOCK_MARKER = "Output Format: Styled HTML"
 SKILL_REFS = (".agents/skills/html-report/SKILL.md", ".agents/skills/ui-design/SKILL.md")
 
 
-def _render(agent_preference, sandbox_enabled=True):
+def _render(agent_preference, main_agent_steering=True):
     """Render the user_profile component with the given agent_preference dict.
 
-    ``sandbox_enabled`` mirrors RuntimeContextMiddleware: True for PTC (has a
-    sandbox/filesystem), False for Flash. Defaults to True so the PTC path is
-    the baseline.
+    ``main_agent_steering`` is True for the main agent's baseline and False
+    for a subagent's prompt. Defaults to True so the main agent is the baseline.
     """
     reset_loader()
-    loader = get_loader()
     profile = {"name": "Demo", "timezone": "UTC", "locale": "en-US"}
     if agent_preference is not None:
         profile["agent_preference"] = agent_preference
-    return loader.render(
-        "components/user_profile.md.j2",
-        user_profile=profile,
-        user_data_counts=None,
-        sandbox_enabled=sandbox_enabled,
-    )
+    return render_user_profile(profile, main_agent_steering=main_agent_steering)
 
 
 @pytest.fixture(autouse=True)
@@ -48,7 +43,7 @@ class TestHtmlSteeringBlock:
     def test_html_renders_block(self):
         out = _render({"output_format": "html"})
         assert HTML_BLOCK_MARKER in out
-        assert "work/<task>/<name>.html" in out
+        assert "<task>/<name>.html" in out
         for ref in SKILL_REFS:
             assert ref in out
 
@@ -67,19 +62,20 @@ class TestHtmlSteeringBlock:
         assert HTML_BLOCK_MARKER not in out
         assert "## Agent Preferences" not in out
 
-    def test_html_no_block_without_sandbox(self):
-        # Flash has no sandbox: HTML steering must not fire even when the user
-        # set output_format=html — there is no filesystem to write the report to.
-        out = _render({"output_format": "html"}, sandbox_enabled=False)
+    def test_html_no_block_for_a_subagent(self):
+        # A subagent hands its result back rather than authoring the
+        # deliverable, so HTML steering must not fire even when the user set
+        # output_format=html.
+        out = _render({"output_format": "html"}, main_agent_steering=False)
         assert HTML_BLOCK_MARKER not in out
         for ref in SKILL_REFS:
             assert ref not in out
 
-    def test_other_prefs_still_render_without_sandbox(self):
-        # Only the filesystem-dependent HTML block is gated; other preferences
-        # still apply in Flash, and output_format never double-renders.
+    def test_other_prefs_still_render_for_a_subagent(self):
+        # Only the main agent's HTML block is gated; other preferences still
+        # apply to a subagent, and output_format never double-renders.
         out = _render(
-            {"output_format": "html", "tone": "concise"}, sandbox_enabled=False
+            {"output_format": "html", "tone": "concise"}, main_agent_steering=False
         )
         assert HTML_BLOCK_MARKER not in out
         assert "- **tone**: concise" in out
@@ -87,7 +83,7 @@ class TestHtmlSteeringBlock:
 
 
 class TestGenericLoop:
-    """output_format is excluded from the generic key/value loop."""
+    """output_format in its vocabulary is excluded from the generic key/value loop."""
 
     def test_output_format_not_double_rendered(self):
         out = _render({"output_format": "html", "proactive_questions": "sometimes"})
@@ -115,3 +111,17 @@ class TestGenericLoop:
         for line in prefs_section.splitlines():
             assert line.strip() != "-"
             assert line.strip() != "- **"
+
+    def test_no_lead_line_over_an_empty_list(self):
+        # With nothing for the loop to print, its lead-in goes too; and a
+        # subagent, which gets no HTML block, gets no section at all.
+        assert "You MUST follow" not in _render({"output_format": "html"})
+        out = _render({"output_format": "html"}, main_agent_steering=False)
+        assert "## Agent Preferences" not in out
+
+    def test_a_format_outside_the_vocabulary_prints_like_any_other_key(self):
+        """Only a value that selects a section is kept off the list: anything
+        else is the user's own words and reaches the model as they wrote it."""
+        out = _render({"output_format": "pdf"})
+        assert HTML_BLOCK_MARKER not in out
+        assert "- **output_format**: pdf" in out

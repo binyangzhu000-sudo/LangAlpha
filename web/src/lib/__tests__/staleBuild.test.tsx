@@ -2,7 +2,7 @@ import React from 'react';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { act, render, screen } from '@testing-library/react';
 import {
   isStaleBuildError,
   checkForNewBuild,
@@ -12,8 +12,10 @@ import {
   STALE_BUILD_EVENT,
   __resetStaleBuildForTests,
 } from '../staleBuild';
-import { toast } from '@/components/ui/use-toast';
+import { toast, type ToastProps } from '@/components/ui/use-toast';
 import { StaleBuildBoundary } from '@/components/StaleBuildBoundary';
+import { Toast, ToastDescription, ToastProvider, ToastTitle, ToastViewport } from '@/components/ui/toast';
+import i18n from '@/i18n';
 
 vi.mock('@/components/ui/use-toast', () => ({ toast: vi.fn() }));
 
@@ -42,6 +44,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.useRealTimers();
+  vi.resetAllMocks();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
@@ -268,6 +271,40 @@ describe('reporting is once per session', () => {
     // the app disappears and the latch above stops it coming back.
     expect(vi.mocked(toast).mock.calls[0][0]).toMatchObject({ pinned: true });
   });
+
+  it('follows a language switch while it is up', async () => {
+    // Pinned with no timeout, so it can outlive the language it was raised in.
+    reportStaleBuild('preload');
+    vi.runAllTimers();
+    // Omit<> over the props' index signature widens every field to unknown.
+    const { title, description, action } = vi.mocked(toast).mock.calls[0][0] as Pick<
+      ToastProps,
+      'title' | 'description' | 'action'
+    >;
+    render(
+      <ToastProvider>
+        <Toast open>
+          <ToastTitle>{title}</ToastTitle>
+          <ToastDescription>{description}</ToastDescription>
+          {action}
+        </Toast>
+        <ToastViewport />
+      </ToastProvider>,
+    );
+    const en = i18n.getFixedT('en-US');
+    const zh = i18n.getFixedT('zh-CN');
+    expect(screen.getByText(en('common.staleBuild.title'))).toBeInTheDocument();
+
+    await act(() => i18n.changeLanguage('zh-CN'));
+    try {
+      expect(screen.getByText(zh('common.staleBuild.title'))).toBeInTheDocument();
+      expect(screen.getByText(zh('common.staleBuild.description'))).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: zh('common.staleBuild.reload') })).toBeInTheDocument();
+      expect(screen.queryByText(en('common.staleBuild.title'))).not.toBeInTheDocument();
+    } finally {
+      await act(() => i18n.changeLanguage('en-US'));
+    }
+  });
 });
 
 describe('checkForNewBuild rate and reporting', () => {
@@ -367,6 +404,40 @@ describe('watchStaleBuild wiring', () => {
     vi.runAllTimers();
     expect(toast).not.toHaveBeenCalled();
   });
+
+  it('reports a failed catalog that names a build asset', () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    const stop = watchStaleBuild();
+    i18n.emit('failedLoading', 'zh-CN', 'translation', new Error(`${CHUNK_MSG}${window.location.origin}/assets/zh-CN-1111.js`));
+    vi.runAllTimers();
+    expect(toast).toHaveBeenCalledTimes(1);
+    expect(fetchMock).not.toHaveBeenCalled();
+    stop();
+  });
+
+  it('asks the server about a failed catalog it cannot classify, inside the throttle too', async () => {
+    // Safari names no URL. A language switch is one user action, so it gets its
+    // answer now rather than from the next resume a minute out.
+    const answer = (build: string) => ({
+      ok: true,
+      headers: new Headers({ 'content-type': 'application/json' }),
+      json: async () => ({ build }),
+    });
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(answer('index-CURRENT.js'))
+      .mockResolvedValue(answer('index-NEWER.js'));
+    vi.stubGlobal('fetch', fetchMock);
+    const stop = watchStaleBuild();
+    await checkForNewBuild();
+
+    i18n.emit('failedLoading', 'zh-CN', 'translation', new Error('Importing a module script failed.'));
+    await vi.runAllTimersAsync();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(toast).toHaveBeenCalledTimes(1);
+    stop();
+  });
 });
 
 describe('markBooted', () => {
@@ -405,11 +476,11 @@ describe('StaleBuildBoundary', () => {
     // The whole point of the classification: a boundary that catches everything
     // turns deterministic bugs into "stale build" reports.
     class Catcher extends React.Component<{ children: React.ReactNode }, { hit: boolean }> {
-      state = { hit: false };
+      override state = { hit: false };
       static getDerivedStateFromError() {
         return { hit: true };
       }
-      render() {
+      override render() {
         return this.state.hit ? <div data-testid="outer" /> : this.props.children;
       }
     }
@@ -431,11 +502,11 @@ describe('StaleBuildBoundary', () => {
     // was thrown", so the boundary renders the children that just threw and
     // they throw again — a loop where a rethrow was intended.
     class Catcher extends React.Component<{ children: React.ReactNode }, { hit: boolean }> {
-      state = { hit: false };
+      override state = { hit: false };
       static getDerivedStateFromError() {
         return { hit: true };
       }
-      render() {
+      override render() {
         return this.state.hit ? <div data-testid="outer" /> : this.props.children;
       }
     }

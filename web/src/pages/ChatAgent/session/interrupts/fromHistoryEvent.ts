@@ -11,10 +11,17 @@ import { updateMessage } from '../../hooks/utils/messageHelpers';
 import {
   setCardStatus,
   resolvePendingHistoryInterrupt,
+  historyCardKey,
   CARD_BUCKET_FOR_TYPE,
 } from './buckets';
-import { claimedCardFields, type HistoryInterruptClaim } from './claims';
+import { claimedCardFields, evidenceLookup, type ApprovalEvidence } from './claims';
 import { buildCreditPauseState } from './creditPauseCard';
+import {
+  batchToolApprovalFields,
+  isToolApprovalInterrupt,
+  resolveApprovalDecision,
+  toolApprovalCards,
+} from './toolApprovalCard';
 import type { SSEEvent, PairState, HistoryInterruptInfo } from '../types';
 import type { HistoryRuntime } from '../runtime';
 
@@ -23,9 +30,10 @@ export interface HistoryInterruptContext {
   assistantMessagesByPair: Map<number, string>;
   pairStateByPair: Map<number, PairState>;
   pendingHistoryInterrupts: HistoryInterruptInfo[];
-  /** What each resume turn recorded about the interrupts it answered, keyed by
-   *  interrupt id — including claims that replayed BEFORE the interrupt. */
-  claimedInterrupts: Map<string, HistoryInterruptClaim>;
+  /** What the still-running resumes in this replay recorded about the
+   *  interrupts they answered, including the ones that replayed BEFORE the
+   *  interrupt they settle. */
+  evidence: ApprovalEvidence;
 }
 
 export function projectHistoryInterrupt(
@@ -69,7 +77,7 @@ export function projectHistoryInterrupt(
     if (
       event.interrupt_id
       && event.turn_index == null
-      && ctx.claimedInterrupts.has(event.interrupt_id)
+      && ctx.evidence.claims.has(event.interrupt_id)
     ) {
       return;
     }
@@ -83,6 +91,32 @@ export function projectHistoryInterrupt(
           proposalId,
           interruptId: proposalId,
         });
+      }
+    } else if (isToolApprovalInterrupt(event.kind, actionRequests[0]) && interruptAssistantId) {
+      // Tool approvals settle from the same stamp and are re-raised for the
+      // same reason, so they get the same treatment: one interrupt to N cards.
+      // A resume that answered every call still records the ids it answered
+      // before the graph consumed the Command, so a repeat says all of those
+      // calls are still stopped: put every card back and re-queue every entry,
+      // or the batch replays answered with nothing left to answer it.
+      const cards = toolApprovalCards(
+        actionRequests,
+        event.interrupt_id,
+        `tool-approval-history-${Date.now()}`,
+      );
+      rt.setMessages((prev) =>
+        cards.reduce((msgs, card) => setCardStatus(msgs, 'toolApprovals', card.proposalId, 'pending'), prev),
+      );
+      for (const card of cards) {
+        if (!ctx.pendingHistoryInterrupts.some((p) => p.proposalId === card.proposalId)) {
+          ctx.pendingHistoryInterrupts.push({
+            type: 'tool_approval',
+            assistantMessageId: interruptAssistantId,
+            proposalId: card.proposalId,
+            interruptId: event.interrupt_id,
+            target: card.target,
+          });
+        }
       }
     }
     return;
@@ -210,7 +244,7 @@ export function projectHistoryInterrupt(
               [proposalId]: {
                 workspace_id: proposalData.workspace_id,
                 workspace_name: proposalData.workspace_name,
-                question: proposalData.question,
+                question: proposalData.question ?? '',
                 report_back: proposalData.report_back ?? true,
                 interruptId: event.interrupt_id,
                 tool_call_id: proposalData.tool_call_id,
@@ -226,6 +260,7 @@ export function projectHistoryInterrupt(
         assistantMessageId: interruptAssistantId,
         proposalId,
         interruptId: event.interrupt_id,
+        toolCallId: proposalData.tool_call_id,
       });
     } else if (actionType === 'delete_workspace' || actionType === 'stop_workspace' || actionType === 'delete_thread') {
       // --- Secretary action interrupt (history) ---
@@ -245,6 +280,7 @@ export function projectHistoryInterrupt(
               [proposalId]: {
                 actionType: actionType as 'delete_workspace' | 'stop_workspace' | 'delete_thread',
                 workspace_id: proposalData.workspace_id,
+                workspace_name: proposalData.workspace_name,
                 thread_id: proposalData.thread_id,
                 interruptId: event.interrupt_id,
                 status: 'pending',
@@ -284,13 +320,13 @@ export function projectHistoryInterrupt(
         proposalId,
         interruptId: event.interrupt_id,
       });
-    } else {
-      // --- Plan approval interrupt (existing) ---
-      const planApprovalId = event.interrupt_id || `plan-history-${Date.now()}`;
-      const description =
-        (actionRequests[0]?.description as string) ||
-        (actionRequests[0]?.args?.plan as string) ||
-        'No plan description provided.';
+    } else if (isToolApprovalInterrupt(event.kind, actionRequests[0])) {
+      // --- Direct MCP tool approval interrupt (history) ---
+      const cards = toolApprovalCards(
+        actionRequests,
+        event.interrupt_id,
+        `tool-approval-history-${Date.now()}`,
+      );
       const order = event._eventId != null ? Number(event._eventId) : ++pairState.contentOrderCounter;
 
       rt.setMessages((prev) =>
@@ -299,26 +335,36 @@ export function projectHistoryInterrupt(
           const msg = m as AssistantMessage;
           return {
             ...msg,
-            contentSegments: [...(msg.contentSegments || []), { type: 'plan_approval' as const, planApprovalId, order }],
-            planApprovals: {
-              ...(msg.planApprovals || {}),
-              [planApprovalId]: {
-                description,
-                interruptId: event.interrupt_id,
-                status: 'pending',
-              },
+            contentSegments: [
+              ...(msg.contentSegments || []),
+              ...cards.map((card, i) => ({
+                type: 'tool_approval' as const,
+                proposalId: card.proposalId,
+                order: order + i,
+              })),
+            ],
+            toolApprovals: {
+              ...(msg.toolApprovals || {}),
+              ...Object.fromEntries(cards.map((c) => [c.proposalId, c.state])),
             },
           };
         })
       );
 
-      ctx.pendingHistoryInterrupts.push({
-        type: 'plan_approval',
-        assistantMessageId: interruptAssistantId,
-        planApprovalId,
-        interruptId: event.interrupt_id,
-      });
+      for (const card of cards) {
+        ctx.pendingHistoryInterrupts.push({
+          type: 'tool_approval',
+          assistantMessageId: interruptAssistantId,
+          proposalId: card.proposalId,
+          interruptId: event.interrupt_id,
+          target: card.target,
+        });
+      }
     }
+    // Any other interrupt gets no card and no pending entry, so replay never
+    // arms it. The only one left in the wild is a SubmitPlan review on a thread
+    // paused before the agent stopped raising it, and nothing can resume it
+    // now: leaving it unarmed lets the next message start a fresh turn.
 
     // The card just rendered, and a still-running resume turn earlier in this
     // replay already said it was answered. Position is not evidence: the tip
@@ -332,23 +378,48 @@ export function projectHistoryInterrupt(
     // terminal turn — a genuine re-raise, or one a failed resume never took —
     // finds none here and keeps its controls.
     const cardId = event.interrupt_id;
-    const claim = cardId ? ctx.claimedInterrupts.get(cardId) : undefined;
+    const claim = cardId ? ctx.evidence.claims.get(cardId) : undefined;
     if (claim && cardId) {
-      // The branch above queued this entry against the same bubble it rendered
-      // the card on, so the ordinary resolver settles it: patch the card, drop
-      // the entry, and what survives replay stays exactly what the user still
-      // owes an answer. A claim that does not prove an outcome patches nothing
-      // and leaves the entry queued.
-      const settled = resolvePendingHistoryInterrupt(
-        ctx.pendingHistoryInterrupts,
-        (p) => p.interruptId === cardId,
-        (m) => {
-          const bucket = CARD_BUCKET_FOR_TYPE[m.type];
-          const fields = claimedCardFields(m.type, claim);
-          return bucket && fields ? { bucket, key: cardId, fields } : null;
-        },
-        rt.setMessages,
+      // The branch above queued these entries against the same bubble it
+      // rendered their cards on, so the ordinary resolver settles them: patch
+      // each card, drop each entry, and what survives replay stays exactly what
+      // the user still owes an answer. A claim that does not prove an outcome
+      // patches nothing and leaves the entries queued, which also ends the loop.
+      //
+      // One entry per card, not one per interrupt: an interrupt that stopped
+      // several calls owns a card per call under its own id, and settling only
+      // the first leaves the rest offering live controls on a running resume,
+      // with no complete decision batch left to answer them.
+
+      // The claim keeps one answer for the whole interrupt, so a batch's cards
+      // take the batch floor rather than N copies of that one verdict. It
+      // changes the verdict a settling card is given, never whether it settles.
+      const batchFields = batchToolApprovalFields(
+        ctx.pendingHistoryInterrupts.filter(
+          (p) => p.type === 'tool_approval' && p.interruptId === cardId,
+        ).length,
       );
+      const lookup = evidenceLookup(ctx.evidence, cardId);
+      let settled = false;
+      while (
+        resolvePendingHistoryInterrupt(
+          ctx.pendingHistoryInterrupts,
+          (p) => p.interruptId === cardId,
+          (m) => {
+            const bucket = CARD_BUCKET_FOR_TYPE[m.type];
+            const key = historyCardKey(m);
+            const claimed = claimedCardFields(m.type, claim);
+            const decided = m.target ? resolveApprovalDecision(m.target, lookup) : null;
+            const fields =
+              decided ??
+              (m.type === 'tool_approval' && claimed && batchFields ? batchFields : claimed);
+            return bucket && key && fields ? { bucket, key, fields } : null;
+          },
+          rt.setMessages,
+        )
+      ) {
+        settled = true;
+      }
       // A settled card is a record, not a control, so it no longer satisfies
       // what the rendered set means to the live path: "a card for this id is
       // already on screen and can still be answered". Release the id, or a

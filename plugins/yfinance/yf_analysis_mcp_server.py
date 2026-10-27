@@ -18,6 +18,7 @@ except ModuleNotFoundError:  # imported as a package module (tests)
     from mcp_servers._bootstrap import MCPServer
 
 import math
+from datetime import datetime, timezone
 
 import yfinance as yf
 
@@ -46,7 +47,7 @@ def get_analyst_recommendations(ticker: str) -> _OUT_GET_ANALYST_RECOMMENDATIONS
     buy/hold/sell balance over recent periods.
 
     Args:
-        ticker: Symbol — US "AAPL", HK "0700.HK", A-share "600519.SS".
+        ticker: Symbol — US "AAPL", HK "0700.HK", A-share "600519.SH".
 
     Returns:
         dict: {symbol, count, data, source}. data is a list of Yahoo-native
@@ -76,7 +77,7 @@ def get_sustainability_data(ticker: str) -> _OUT_GET_SUSTAINABILITY_DATA:
     """ESG / sustainability scores for a company. Use for ESG risk context.
 
     Args:
-        ticker: Symbol — US "AAPL", HK "0700.HK", A-share "600519.SS".
+        ticker: Symbol — US "AAPL", HK "0700.HK", A-share "600519.SH".
 
     Returns:
         dict: {symbol, count, data, source}. data is a single Yahoo-native ESG
@@ -113,7 +114,7 @@ def get_institutional_holders(ticker: str) -> _OUT_GET_INSTITUTIONAL_HOLDERS:
     the largest positions.
 
     Args:
-        ticker: Symbol — US "AAPL", HK "0700.HK", A-share "600519.SS".
+        ticker: Symbol — US "AAPL", HK "0700.HK", A-share "600519.SH".
 
     Returns:
         dict: {symbol, count, data, source}. data is a list of Yahoo-native
@@ -145,7 +146,7 @@ def get_mutualfund_holders(ticker: str) -> _OUT_GET_MUTUALFUND_HOLDERS:
     positions.
 
     Args:
-        ticker: Symbol — US "AAPL", HK "0700.HK", A-share "600519.SS".
+        ticker: Symbol — US "AAPL", HK "0700.HK", A-share "600519.SH".
 
     Returns:
         dict: {symbol, count, data, source}. data is a list of Yahoo-native
@@ -175,7 +176,7 @@ def get_insider_transactions(ticker: str) -> _OUT_GET_INSIDER_TRANSACTIONS:
     """Recent insider buy/sell transactions. Use to track insider activity.
 
     Args:
-        ticker: Symbol — US "AAPL", HK "0700.HK", A-share "600519.SS".
+        ticker: Symbol — US "AAPL", HK "0700.HK", A-share "600519.SH".
 
     Returns:
         dict: {symbol, count, data, source}. data is a list of Yahoo-native
@@ -207,7 +208,7 @@ def get_insider_roster(ticker: str) -> _OUT_GET_INSIDER_ROSTER:
     their share positions.
 
     Args:
-        ticker: Symbol — US "AAPL", HK "0700.HK", A-share "600519.SS".
+        ticker: Symbol — US "AAPL", HK "0700.HK", A-share "600519.SH".
 
     Returns:
         dict: {symbol, count, data, source}. data is a list of Yahoo-native
@@ -227,6 +228,38 @@ def get_insider_roster(ticker: str) -> _OUT_GET_INSIDER_ROSTER:
         )
 
 
+def _search_news(yf_symbol: str, count: int) -> list[dict]:
+    """News from Yahoo's search endpoint, in the shape ``get_news`` returns.
+
+    yfinance reads news from an endpoint Yahoo has stopped serving (it answers
+    404, which yfinance turns into an empty list), while search still carries
+    headlines. Each item is reshaped into the ``content`` layout the primary
+    endpoint used, so callers see one format. Search cannot filter by tab.
+    """
+    try:
+        items = yf.Search(yf_symbol, news_count=count, max_results=0).news
+    except Exception:  # noqa: BLE001 - the primary path already returned nothing
+        return []
+    articles = []
+    for item in items or []:
+        published = item.get("providerPublishTime")
+        articles.append(
+            {
+                "id": item.get("uuid"),
+                "content": {
+                    "title": item.get("title"),
+                    "contentType": item.get("type"),
+                    "pubDate": datetime.fromtimestamp(published, timezone.utc).isoformat()
+                    if isinstance(published, (int, float))
+                    else None,
+                    "provider": {"displayName": item.get("publisher")},
+                    "canonicalUrl": {"url": item.get("link")},
+                },
+            }
+        )
+    return articles
+
+
 _OUT_GET_NEWS = output_model(
     "GetNewsOut", envelope_schema(RECORDS, frame=("symbol",))
 )
@@ -238,7 +271,7 @@ def get_news(ticker: str, count: int = 10, tab: str = "news") -> _OUT_GET_NEWS:
     coverage.
 
     Args:
-        ticker: Symbol — US "AAPL", HK "0700.HK", A-share "600519.SS".
+        ticker: Symbol — US "AAPL", HK "0700.HK", A-share "600519.SH".
         count: Number of articles (default 10).
         tab: One of "news", "all", or "press releases".
 
@@ -252,6 +285,8 @@ def get_news(ticker: str, count: int = 10, tab: str = "news") -> _OUT_GET_NEWS:
     symbol, yf_symbol, _ = boundary(ticker)
     try:
         articles = yf.Ticker(yf_symbol).get_news(count=count, tab=tab)
+        if not articles and tab.lower() != "press releases":
+            articles = _search_news(yf_symbol, count)
         if not articles:
             return make_response([], source=SOURCE, symbol=symbol)
         data = [clean_value(item) for item in articles]
@@ -271,7 +306,7 @@ def get_analyst_price_targets(ticker: str) -> _OUT_GET_ANALYST_PRICE_TARGETS:
     current price.
 
     Args:
-        ticker: Symbol — US "AAPL", HK "0700.HK", A-share "600519.SS".
+        ticker: Symbol — US "AAPL", HK "0700.HK", A-share "600519.SH".
 
     Returns:
         dict: {symbol, count, data, source}. data is a single Yahoo-native
@@ -311,7 +346,7 @@ def get_upgrades_downgrades(ticker: str) -> _OUT_GET_UPGRADES_DOWNGRADES:
     how the sell-side rating evolved.
 
     Args:
-        ticker: Symbol — US "AAPL", HK "0700.HK", A-share "600519.SS".
+        ticker: Symbol — US "AAPL", HK "0700.HK", A-share "600519.SH".
 
     Returns:
         dict: {symbol, count, data, source}. data is a list of Yahoo-native
@@ -342,7 +377,7 @@ def get_earnings_history(ticker: str) -> _OUT_GET_EARNINGS_HISTORY:
     earnings beats/misses. Same data as get_earnings_data (fundamentals server).
 
     Args:
-        ticker: Symbol — US "AAPL", HK "0700.HK", A-share "600519.SS".
+        ticker: Symbol — US "AAPL", HK "0700.HK", A-share "600519.SH".
 
     Returns:
         dict: {symbol, count, data, source}. data is a list of Yahoo-native
@@ -372,7 +407,7 @@ def get_earnings_estimates(ticker: str) -> _OUT_GET_EARNINGS_ESTIMATES:
     quarters and years.
 
     Args:
-        ticker: Symbol — US "AAPL", HK "0700.HK", A-share "600519.SS".
+        ticker: Symbol — US "AAPL", HK "0700.HK", A-share "600519.SH".
 
     Returns:
         dict: {symbol, count, data, source}. data is a list of Yahoo-native
@@ -402,7 +437,7 @@ def get_revenue_estimates(ticker: str) -> _OUT_GET_REVENUE_ESTIMATES:
     quarters and years.
 
     Args:
-        ticker: Symbol — US "AAPL", HK "0700.HK", A-share "600519.SS".
+        ticker: Symbol — US "AAPL", HK "0700.HK", A-share "600519.SH".
 
     Returns:
         dict: {symbol, count, data, source}. data is a list of Yahoo-native
@@ -432,7 +467,7 @@ def get_growth_estimates(ticker: str) -> _OUT_GET_GROWTH_ESTIMATES:
     compare a name's growth outlook to its peers.
 
     Args:
-        ticker: Symbol — US "AAPL", HK "0700.HK", A-share "600519.SS".
+        ticker: Symbol — US "AAPL", HK "0700.HK", A-share "600519.SH".
 
     Returns:
         dict: {symbol, count, data, source}. data is a list of Yahoo-native
@@ -462,7 +497,7 @@ def get_major_holders(ticker: str) -> _OUT_GET_MAJOR_HOLDERS:
     high-level ownership summary.
 
     Args:
-        ticker: Symbol — US "AAPL", HK "0700.HK", A-share "600519.SS".
+        ticker: Symbol — US "AAPL", HK "0700.HK", A-share "600519.SH".
 
     Returns:
         dict: {symbol, count, data, source}. data is a list of Yahoo-native

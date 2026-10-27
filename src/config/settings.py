@@ -12,7 +12,11 @@ import os
 from typing import Any, Dict, List, Optional
 
 from src.config.core import get_infrastructure_config
-from src.config.models import NewsPollConfig, WorkflowOrchestrationConfig
+from src.config.models import (
+    NewsPollConfig,
+    OrderReconcileConfig,
+    WorkflowOrchestrationConfig,
+)
 
 # Re-export env-var constants for backward compatibility
 from src.config.env import (  # noqa: F401
@@ -47,14 +51,6 @@ def background_dispatch_requires_token() -> bool:
 
 def get_debug_mode() -> bool:
     return get_infrastructure_config().debug
-
-
-def get_ptc_recursion_limit() -> int:
-    return get_infrastructure_config().ptc_recursion_limit
-
-
-def get_flash_recursion_limit() -> int:
-    return get_infrastructure_config().flash_recursion_limit
 
 
 def get_workflow_timeout() -> int:
@@ -107,6 +103,10 @@ def is_result_log_db_enabled() -> bool:
 
 def is_redis_warm_on_startup_enabled() -> bool:
     return get_infrastructure_config().redis_warm_on_startup
+
+
+def is_brokerage_marks_warm_on_startup_enabled() -> bool:
+    return get_infrastructure_config().brokerage_marks_warm_on_startup
 
 
 def is_langsmith_tracing_enabled() -> bool:
@@ -197,6 +197,11 @@ def is_redis_cache_enabled() -> bool:
 def get_news_poll_config() -> NewsPollConfig:
     """News refresh poller config (enabled / interval / max_items / feeds)."""
     return get_infrastructure_config().news_poll
+
+
+def get_order_reconcile_config() -> OrderReconcileConfig:
+    """Order reconciliation sweep config (enabled / cadence / windows / batch)."""
+    return get_infrastructure_config().order_reconcile
 
 
 def get_redis_max_connections() -> int:
@@ -325,17 +330,6 @@ def get_recovery_scan_interval() -> float:
     return value if math.isfinite(value) and value > 0 else 30.0
 
 
-def get_replay_projection_cache_ttl() -> int:
-    """Env REPLAY_PROJECTION_CACHE_TTL_SECONDS, default 14 days. 0 disables."""
-    default = 14 * 86400
-    try:
-        return max(
-            0, int(os.getenv("REPLAY_PROJECTION_CACHE_TTL_SECONDS", str(default)))
-        )
-    except ValueError:
-        return default
-
-
 def get_redis_socket_connect_timeout() -> int:
     return get_infrastructure_config().redis.socket_connect_timeout
 
@@ -364,10 +358,6 @@ def get_redis_ttl_cancel_flag() -> int:
     return get_infrastructure_config().redis.ttl.cancel_flag
 
 
-def get_redis_ttl_steering() -> int:
-    return get_infrastructure_config().redis.ttl.steering
-
-
 def get_market_watch_min_interval() -> int:
     return get_infrastructure_config().market_watch.min_interval_seconds
 
@@ -376,8 +366,8 @@ def get_market_watch_max_symbols() -> int:
     return get_infrastructure_config().market_watch.max_symbols
 
 
-def get_market_watch_cache_pin() -> bool:
-    return get_infrastructure_config().market_watch.cache_breakpoint_pin
+def get_market_watch_target_warning_minutes() -> int:
+    return get_infrastructure_config().market_watch.target_warning_minutes
 
 
 def get_redis_ttl_market_watch() -> int:
@@ -448,6 +438,10 @@ def get_max_stored_messages_per_agent() -> int:
     return get_infrastructure_config().background_execution.max_stored_messages_per_agent
 
 
+def get_max_stream_bytes_per_run() -> int:
+    return get_infrastructure_config().background_execution.max_stream_bytes_per_run
+
+
 def get_subagent_collector_timeout() -> float:
     return get_infrastructure_config().background_execution.subagent_collector_timeout
 
@@ -507,10 +501,6 @@ def get_max_workflow_retries() -> int:
     return get_infrastructure_config().background_execution.max_workflow_retries
 
 
-def get_merged_chunk_max_bytes() -> int:
-    return get_infrastructure_config().background_execution.merged_chunk_max_bytes
-
-
 def get_redis_ttl_workflow_events() -> int:
     return get_infrastructure_config().redis.ttl.workflow_events
 
@@ -553,20 +543,9 @@ def get_config(
 # =============================================================================
 
 
-def get_langsmith_tags(
-    msg_type: str,
-    locale: Optional[str] = None,
-) -> List[str]:
-    """Build LangSmith tags list for a workflow run."""
-    tags = []
-
-    workflow_map = {
-        "technical_analysis": "workflow:technical_analysis",
-        "fundamental_analysis": "workflow:fundamental_analysis",
-        "podcast_generation": "workflow:podcast_generation",
-    }
-    tags.append(workflow_map.get(msg_type, "workflow:chat"))
-
+def get_langsmith_tags(locale: Optional[str] = None) -> List[str]:
+    """Build LangSmith tags list for a chat turn."""
+    tags = ["workflow:chat"]
     if locale:
         tags.append(f"locale:{locale}")
 
@@ -581,7 +560,6 @@ def get_langsmith_metadata(
     locale: Optional[str] = None,
     timezone: Optional[str] = None,
     llm_model: Optional[str] = None,
-    plan_mode: bool = False,
     platform: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Build LangSmith metadata dict for a workflow run (omits None values).
@@ -608,8 +586,6 @@ def get_langsmith_metadata(
         metadata["timezone"] = timezone
     if llm_model:
         metadata["llm_model"] = llm_model
-    if plan_mode:
-        metadata["plan_mode"] = plan_mode
     if platform:
         metadata["platform"] = platform
 

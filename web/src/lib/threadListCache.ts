@@ -36,9 +36,9 @@ export function insertOptimisticThread(queryClient: QueryClient, thread: Thread)
 
 /**
  * Apply a (generated or renamed) title to every cached thread list holding
- * the row, plus the detail entry. List entries without the row are skipped —
- * this never invents rows, only rewrites titles in place, so list order and
- * pagination are untouched.
+ * the row, plus the detail entry and the hand-off cards' liveness reads.
+ * Entries without the row are skipped — this never invents rows, only
+ * rewrites titles in place, so list order and pagination are untouched.
  *
  * `updatedAt` is the title write's row timestamp (every server title write
  * bumps updated_at): a patch not newer than the cached row is dropped, so a
@@ -69,7 +69,23 @@ export function patchThreadTitle(
     queryKeys.threads.detail(threadId),
     (old: Thread | undefined) => (old ? apply(old) : old),
   );
+  // The hand-off cards' and the roster's liveness reads, rows with no
+  // updated_at. A card stops reading once its run settles, so a title written
+  // after that reaches it only from here. Unchanged entries return undefined,
+  // which skips the write: returning the same rows would count as a fresh read
+  // and restart the cards' poll timers. A cleared title is stored as null, as
+  // the server reads it.
+  queryClient.setQueriesData<{ liveness: LivenessRow[] }>(
+    { queryKey: queryKeys.threads.dispatchLivenessAll() },
+    (data) => {
+      if (!data?.liveness.some((r) => r.thread_id === threadId)) return undefined;
+      const liveness = data.liveness.map((r) => (r.thread_id === threadId ? { ...r, title: title || null } : r));
+      return { ...data, liveness };
+    },
+  );
 }
+
+type LivenessRow = { thread_id: string; title?: string | null };
 
 /**
  * Stamp a seen cursor onto every cached row of the thread; rows are re-seeded

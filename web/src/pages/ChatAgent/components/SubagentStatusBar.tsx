@@ -2,11 +2,9 @@ import React, { useState, useRef, useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
 import { MessageSquarePlus, Send, X } from 'lucide-react';
 import { Loader } from '@/components/ui/loader';
-import { cn } from '../../../lib/utils';
 import iconRobo from '../../../assets/img/icon-robo.png';
 import iconRoboSing from '../../../assets/img/icon-robo-sing.png';
 import Markdown from './Markdown';
-import { sendSubagentMessage } from '../utils/api';
 import { deriveSubagentStatus } from '../session/subagents/subagentStatus';
 import { SubagentStatusIcon } from './taskStatusUi';
 import './NavigationPanel.css';
@@ -33,8 +31,8 @@ interface Agent {
 
 interface SubagentStatusBarProps {
   agent: Agent | null;
-  threadId: string;
-  onInstructionSent?: (text: string) => void;
+  /** Shows the instruction pending, sends it, and takes it back if the send fails. */
+  onSendInstruction?: (text: string) => Promise<void>;
 }
 
 /**
@@ -44,7 +42,7 @@ interface SubagentStatusBarProps {
  * Shows agent avatar, name, description, status, and current tool.
  * Includes an expandable input for sending instructions to running subagents.
  */
-function SubagentStatusBar({ agent, threadId, onInstructionSent }: SubagentStatusBarProps): React.ReactElement | null {
+function SubagentStatusBar({ agent, onSendInstruction }: SubagentStatusBarProps): React.ReactElement | null {
   const { t } = useTranslation();
   const [inputOpen, setInputOpen] = useState(false);
   const [inputValue, setInputValue] = useState('');
@@ -53,26 +51,20 @@ function SubagentStatusBar({ agent, threadId, onInstructionSent }: SubagentStatu
 
   const handleSend = useCallback(async (): Promise<void> => {
     const text = inputValue.trim();
-    const tId = agent?.name?.replace('Task-', '') || null;
     // 'completed', 'cancelled' and 'error' are all terminal — no steering a
     // settled task (an optimistic instruction would render before the
     // backend rejects it).
-    if (!text || sending || !threadId || !tId || agent?.status === 'completed' || agent?.status === 'cancelled' || agent?.status === 'error') return;
-
-    // Immediately show pending message in the subagent view
-    onInstructionSent?.(text);
+    if (!text || sending || agent?.status === 'completed' || agent?.status === 'cancelled' || agent?.status === 'error') return;
 
     setSending(true);
     setInputValue('');
     setInputOpen(false);
     try {
-      await sendSubagentMessage(threadId, tId, text);
-    } catch (err) {
-      console.error('[SubagentStatusBar] Failed to send message:', err);
+      await onSendInstruction?.(text);
     } finally {
       setSending(false);
     }
-  }, [inputValue, sending, threadId, agent?.name, agent?.status, onInstructionSent]);
+  }, [inputValue, sending, agent?.status, onSendInstruction]);
 
   const handleKeyDown = useCallback((e: React.KeyboardEvent<HTMLInputElement>): void => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -109,11 +101,8 @@ function SubagentStatusBar({ agent, threadId, onInstructionSent }: SubagentStatu
   const isError = effectiveStatus === 'error';
   const isTerminal = isCompleted || isCancelled || isError;
 
-  // Extract task ID from display ID (e.g. "Task-k7Xm2p" -> "k7Xm2p")
-  const taskId = agent.name?.replace('Task-', '') || null;
-
-  // Can send: subagent is not terminal (running/initializing), with thread + task.
-  const canSend = !isTerminal && threadId && taskId != null;
+  // Can send: subagent is not terminal (running/initializing).
+  const canSend = !isTerminal;
 
   // Terminal outcome wins over the derived current tool: a task reaped
   // mid-tool-call leaves that call forever "in progress", but the run is
@@ -149,19 +138,19 @@ function SubagentStatusBar({ agent, threadId, onInstructionSent }: SubagentStatu
 
   return (
     <div className="space-y-2">
+      {/* Every row here sits in the composer's slot, over the transcript, so
+          each fill is opaque: a translucent one lets the messages read
+          through it. */}
       <div
         className="flex items-center gap-3 px-4 py-3 rounded-lg"
         style={{
-          backgroundColor: 'var(--color-border-muted)',
-          border: '1px solid var(--color-border-muted)',
+          backgroundColor: 'var(--color-bg-card)',
+          border: '1px solid var(--color-border-input)',
         }}
       >
         {/* Agent avatar */}
         <div
-          className={cn(
-            "w-10 h-10 rounded-lg flex items-center justify-center flex-shrink-0",
-            isActive && !isCompleted && "nav-panel-agent-pulse"
-          )}
+          className="w-10 h-10 rounded-lg flex items-center justify-center shrink-0"
           style={{
             backgroundColor: isActive && !isCompleted
               ? 'var(--color-accent-soft)'
@@ -208,7 +197,7 @@ function SubagentStatusBar({ agent, threadId, onInstructionSent }: SubagentStatu
         </div>
 
         {/* Right side: status + instruction button stacked */}
-        <div className="flex flex-col items-end gap-1.5 flex-shrink-0">
+        <div className="flex flex-col items-end gap-1.5 shrink-0">
           <div className="flex items-center gap-1.5">
             <SubagentStatusIcon status={iconStatus} surface="statusBar" className="h-4 w-4" />
             <span className="text-xs whitespace-nowrap" style={{ color: isCompleted ? 'var(--color-accent-primary)' : 'var(--color-text-tertiary)' }}>
@@ -248,11 +237,12 @@ function SubagentStatusBar({ agent, threadId, onInstructionSent }: SubagentStatu
         <div
           className="flex items-start gap-2 px-4 py-2.5 rounded-lg"
           style={{
-            backgroundColor: isError ? 'var(--color-loss-soft)' : 'var(--color-bg-tool-card)',
+            backgroundColor: isError ? 'var(--color-bg-card)' : 'var(--color-bg-tool-card)',
+            backgroundImage: isError ? 'linear-gradient(var(--color-loss-soft), var(--color-loss-soft))' : undefined,
             border: `1px solid ${isError ? 'var(--color-border-loss)' : 'var(--color-border-muted)'}`,
           }}
         >
-          <SubagentStatusIcon status={effectiveStatus} className="h-4 w-4 flex-shrink-0 mt-0.5" />
+          <SubagentStatusIcon status={effectiveStatus} className="h-4 w-4 shrink-0 mt-0.5" />
           <div className="min-w-0">
             <div
               className="text-xs font-medium"
@@ -261,7 +251,7 @@ function SubagentStatusBar({ agent, threadId, onInstructionSent }: SubagentStatu
               {t(isError ? 'chat.subagentBar.errorHeading' : 'chat.subagentBar.stoppedHeading')}
             </div>
             {agent.error && (
-              <div className="text-xs mt-0.5 break-words" style={{ color: 'var(--color-text-tertiary)' }}>
+              <div className="text-xs mt-0.5 wrap-break-word" style={{ color: 'var(--color-text-tertiary)' }}>
                 {agent.error}
               </div>
             )}
@@ -272,11 +262,14 @@ function SubagentStatusBar({ agent, threadId, onInstructionSent }: SubagentStatu
       {/* Expandable instruction input — canSend gates it so an input left
           open when the task reaches terminal (e.g. errors) disappears. */}
       {inputOpen && canSend && (
+        // The field is borderless inside this box, so the box takes its focus
+        // edge (owns-its-edge) and its keyboard ring (rings-within); left on
+        // the field, both draw as a rectangle inside the card.
         <div
-          className="flex items-center gap-2 px-3 py-2 rounded-lg"
+          className="rings-within owns-its-edge flex items-center gap-2 px-3 py-2 rounded-lg"
           style={{
-            backgroundColor: 'var(--color-border-muted)',
-            border: '1px solid var(--color-border-elevated)',
+            backgroundColor: 'var(--color-bg-card)',
+            border: '1px solid var(--color-border-input)',
           }}
         >
           <input
